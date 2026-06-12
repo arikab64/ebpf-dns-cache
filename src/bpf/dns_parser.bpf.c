@@ -511,6 +511,20 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
                 ev->ip4 = *(u32 *)(data + rdata);
                 __builtin_memset(ev->ip6, 0, sizeof(ev->ip6));
             }
+            else
+            {
+                if (data + rdata + 16 > data_end)
+                {
+                    bpf_ringbuf_discard(ev, 0);
+                    return XDP_PASS;
+                }
+                ev->is_ipv6 = 1;
+                ev->ip4 = 0;
+                #pragma unroll
+                for (int i = 0; i < 16; i++)
+                    ev->ip6[i] = *((__u8 *)(data + rdata + i));
+            }
+
             #pragma unroll
             for (int i = 0; i < DNS_MAX_NAME_LEN; i++) {
                 if (i >= nl)
