@@ -1,0 +1,28 @@
+[package]
+name = "dns-parser"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "loader"
+path = "src/main.rs"
+
+[dependencies]
+libbpf-rs = "0.26"
+libc = "0.2"
+anyhow = "1"
+ctrlc = "3"
+log = "0.4"
+flexi_logger = "0.29"
+
+# eBPF skeleton is generated out-of-band with the `cargo libbpf` subcommand
+# (provided by the `libbpf-cargo` CLI), not via a build script. Workflow:
+#
+#     cargo install libbpf-cargo          # one-time, installs `cargo libbpf`
+#     cargo libbpf build --clang-args=-I. # compile *.bpf.c -> target/bpf/*.bpf.o
+#     cargo libbpf gen                    # (re)generate src/bpf/dns_parser.skel.rs
+#
+# The generated skeleton is checked in and included by src/main.rs.
+[package.metadata.libbpf]
+prog_dir = "src/bpf"
+target_dir = "bpf"
