@@ -5,6 +5,18 @@
 
 char _license[] SEC("license") = "GPL";
 
+/* 
+ * Global configuration. Set from user-space loader via skeleton rodata. 
+ * 'volatile' prevents the compiler from optimizing away the check.
+ */
+volatile const bool debug = false;
+
+#define bpf_printk0(fmt, ...) \
+    do { \
+        if (debug) \
+            bpf_printk(fmt, ##__VA_ARGS__); \
+    } while (0)
+
 typedef struct dns_hdr {
     u16 id;
     u16 flags;
@@ -79,7 +91,7 @@ static __always_inline void finalize(dns_parser_state_t *st)
             st->cache[ec].start  = pl.start_cursor;
             st->cache[ec].len    = (u8)len;
             st->entry_count = ec + 1;
-            //bpf_printk("[dns-parser-%d]: entry %d, offset %d, start %d, len %d\n",
+            //bpf_printk0("[dns-parser-%d]: entry %d, offset %d, start %d, len %d\n",
             //           st->id, ec, pl.key_offset, pl.start_cursor, len);
         }
     }
@@ -211,7 +223,7 @@ int xdp_dns_ingress(struct xdp_md *ctx)
     st->a_remaining  = ancount;
     st->answer_idx   = 0;
 
-    bpf_printk("[dns-parser-%d/%d] flags=0x%04x qd=%d an=%d\n",
+    bpf_printk0("[dns-parser-%d/%d] flags=0x%04x qd=%d an=%d\n",
                st->id, st->cpu, bpf_ntohs(dns->flags), st->qcount, st->acount);
 
     if (st->q_remaining > 0) 
@@ -225,7 +237,7 @@ int xdp_dns_ingress(struct xdp_md *ctx)
     }
    
 
-    bpf_printk("[dns-parser-%d] tail call failed\n", st->id);
+    bpf_printk0("[dns-parser-%d] tail call failed\n", st->id);
 
     return XDP_PASS;
 }
@@ -261,7 +273,7 @@ int xdp_dns_parse_fqdn(struct xdp_md *ctx)
             st->packet_offset = off + 1;
             finalize(st);
             name_complete(st);
-            bpf_printk("[dns-parser-%d/%d] parse_fqdn: fqdn=%s\n", st->id, st->cpu, st->name_buf);
+            bpf_printk0("[dns-parser-%d/%d] parse_fqdn: fqdn=%s\n", st->id, st->cpu, st->name_buf);
             bpf_tail_call(ctx, &jmp_table, st->return_prog);
             return XDP_PASS;
         }
@@ -373,11 +385,11 @@ error:
     if (st)
     {
         // print the src, the payload len, offset, and the error code for debugging
-        bpf_printk("[dns-parser-%d] parse_fqdn error: code=%d, src=%d, offset=%d, payload_len=%d\n",
+        bpf_printk0("[dns-parser-%d] parse_fqdn error: code=%d, src=%d, offset=%d, payload_len=%d\n",
                    st->id, err, st->packet_offset, (u32)(data_end - data));
     }
     else 
-        bpf_printk("[dns-parser-NONE] parse_fqdn error: %d (no state)\n", err);
+        bpf_printk0("[dns-parser-NONE] parse_fqdn error: %d (no state)\n", err);
     return XDP_PASS;
 }
 
@@ -400,7 +412,7 @@ int xdp_dns_walk_question(struct xdp_md *ctx)
     if (st->q_remaining > 0)
         st->q_remaining -= 1;
 
-    bpf_printk("[dns-parser-%d/%d] walk_question: q_remaining=%d\n", st->id, st->cpu, st->q_remaining);
+    bpf_printk0("[dns-parser-%d/%d] walk_question: q_remaining=%d\n", st->id, st->cpu, st->q_remaining);
 
     if (st->q_remaining > 0) 
     {
@@ -430,13 +442,13 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
 
     if (st->a_remaining == 0)
     {
-        bpf_printk("[dns-parser-%d/%d] walk_answer: all answers processed\n", st->id, st->cpu);
+        bpf_printk0("[dns-parser-%d/%d] walk_answer: all answers processed\n", st->id, st->cpu);
         return XDP_PASS;
     }
 
     if (!st->name_ready)
     {
-        bpf_printk("[dns-parser-%d/%d] walk_answer: a_remaining=%d\n", st->id, st->cpu, st->a_remaining);
+        bpf_printk0("[dns-parser-%d/%d] walk_answer: a_remaining=%d\n", st->id, st->cpu, st->a_remaining);
         st->name_ready = 1;
         st->return_prog = PROG_WALK_ANSWER;
         bpf_tail_call(ctx, &jmp_table, PROG_PARSE_FQDN);

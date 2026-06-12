@@ -122,7 +122,13 @@ impl Harness {
     /// the loader in `main.rs`. Returns the loaded skeleton.
     fn load(&mut self) -> DnsParserSkel<'_> {
         let builder = DnsParserSkelBuilder::default();
-        let open_skel = builder.open(&mut self.obj).expect("open skeleton");
+        let mut open_skel = builder.open(&mut self.obj).expect("open skeleton");
+
+        // Always enable BPF debug logging in tests
+        if let Some(rodata) = open_skel.maps.rodata_data.as_mut() {
+            rodata.debug = true;
+        }
+
         let skel = open_skel.load().expect("load skeleton");
 
         let tail_calls = [

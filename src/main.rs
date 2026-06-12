@@ -120,18 +120,43 @@ fn main() -> Result<()> {
         .start()?;
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("usage: {} <iface>", args[0]);
-        std::process::exit(1);
+    let mut ifname = None;
+    let mut debug_enabled = false;
+
+    for arg in args.iter().skip(1) {
+        if arg == "-v" {
+            debug_enabled = true;
+        } else if ifname.is_none() {
+            ifname = Some(arg);
+        } else {
+            eprintln!("too many arguments");
+            eprintln!("usage: {} [-v] <iface>", args[0]);
+            std::process::exit(1);
+        }
     }
-    let ifname = &args[1];
+
+    let ifname = match ifname {
+        Some(n) => n,
+        None => {
+            eprintln!("usage: {} [-v] <iface>", args[0]);
+            std::process::exit(1);
+        }
+    };
+
     let ifindex = if_nametoindex(ifname)?;
 
     let mut open_obj = std::mem::MaybeUninit::uninit();
     let builder = DnsParserSkelBuilder::default();
-    let open_skel = builder
+    let mut open_skel = builder
         .open(&mut open_obj)
         .context("failed to open skeleton")?;
+
+    if debug_enabled {
+        if let Some(rodata) = open_skel.maps.rodata_data.as_mut() {
+            rodata.debug = true;
+        }
+    }
+
     let skel = open_skel.load().context("failed to load skeleton")?;
 
     // Seed the tail-call program array: each parser stage is reachable from the
