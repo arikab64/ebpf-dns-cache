@@ -173,13 +173,14 @@ make test-one TEST=parses_multi_label_fqdn
 ## Usage
 
 ```bash
-sudo ./target/debug/ebpf-dns-cache [-v] [--dump-cache] <interface>
+sudo ./target/debug/ebpf-dns-cache [-v] [--dump-cache | --tui] <interface>
 # e.g.
 sudo ./target/debug/ebpf-dns-cache eth0
 ```
 
 - `-v` enables verbose BPF debug logging.
 - `--dump-cache` prints the current reverse cache and exits (see below). An interface is not required in this mode.
+- `--tui` runs an interactive terminal UI (see [Interactive TUI](#interactive-tui)). Requires an interface; mutually exclusive with `--dump-cache`.
 
 Example output:
 
@@ -208,6 +209,40 @@ INFO [loader] 2 live entries
 ```
 
 Entries whose age exceeds their TTL are skipped (treated as a miss), so the dump reflects only currently-valid mappings.
+
+### Interactive TUI
+
+`--tui` attaches like a normal run but, instead of streaming log lines, presents a [ratatui](https://ratatui.rs)-based terminal UI with two tabbed panels:
+
+```bash
+sudo ./target/release/ebpf-dns-cache --tui eth0
+```
+
+- **Events** — a live, tail-following feed of parsed DNS answers (name, record type, address, TTL, transaction id / answer index) as they arrive on the `events` ring buffer.
+- **Cache** — the in-kernel `dns_reverse` map (`address → name`, TTL, age), re-read every ~5 seconds (or on demand with `r`), with expired entries filtered out.
+
+A background worker thread owns the skeleton and ring buffers and snapshots the cache; the main thread renders and handles input. In TUI mode logging is file-only (`dns-cache_*.log`) so it can't corrupt the screen, and `payloads.json` is still written.
+
+Both panels support **filtering** and **sorting**. The filter is a case-insensitive substring matched against both the name and the address; sorting cycles through the panel's columns (the sorted column is marked with `↑`/`↓` in its header). Sorting the Events feed reorders the buffered rows and suspends tail-following until you turn the sort back off (or press `G`).
+
+Keybindings:
+
+| Key | Action |
+|-----|--------|
+| `Tab` | switch panel (Events ⇄ Cache) |
+| `/` | filter: type a query (applied live), `Enter` keeps it, `Esc` clears it |
+| `c` | clear the active filter |
+| `v` | cycle IP family filter (all → v4 → v6) |
+| `s` | cycle the active panel's sort column (off → first → … → off) |
+| `S` | toggle sort direction (ascending / descending) |
+| `↑` / `↓`, `PgUp` / `PgDn` | scroll the active panel (PgUp/PgDn by 10 rows) |
+| `g` / `G` | jump to top / bottom (`G` resumes following the feed) |
+| `Space` / `p` | pause/resume the feed (also auto-paused when you scroll up) |
+| `r` | force an immediate cache refresh |
+| `?` / `h` | toggle the help overlay |
+| `q` / `Esc` / `Ctrl-C` | quit (detaches XDP and restores the terminal) |
+
+The footer shows live/paused state, the active sort, the active filter, current cache size, the count of feed events dropped under load, and any worker error.
 
 ## Kernel requirements
 

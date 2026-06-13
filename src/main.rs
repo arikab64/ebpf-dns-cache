@@ -16,6 +16,8 @@ mod dns_parser {
 }
 use dns_parser::*;
 
+mod tui;
+
 #[cfg(test)]
 mod tests;
 
@@ -28,20 +30,58 @@ const PROG_EMIT_EVENTS: u32 = 3;
 use libbpf_rs::XdpFlags;
 
 // Mirror of dns_event_t from dns_parser.h. Keep field order and types in sync.
-const DNS_MAX_NAME_LEN: usize = 255;
+pub(crate) const DNS_MAX_NAME_LEN: usize = 255;
 
 #[repr(C)]
-struct DnsEvent {
+pub(crate) struct DnsEvent {
     qtype:      u16,
     name_len:   u16,
-    txid:       u16,
-    answer_idx: u16,
+    pub(crate) txid:       u16,
+    pub(crate) answer_idx: u16,
     is_ipv6:    u8,
     _pad:       [u8; 3],
     ip4:        u32,
     ip6:        [u8; 16],
-    ttl:        u32,
+    pub(crate) ttl:        u32,
     name:       [u8; DNS_MAX_NAME_LEN + 1],
+}
+
+impl DnsEvent {
+    /// The owner FQDN, trimmed to the recorded `name_len`.
+    pub(crate) fn name(&self) -> String {
+        let n = (self.name_len as usize).min(DNS_MAX_NAME_LEN);
+        String::from_utf8_lossy(&self.name[..n]).into_owned()
+    }
+
+    /// "A" or "AAAA" depending on the address family.
+    pub(crate) fn record_type(&self) -> &'static str {
+        if self.is_ipv6 != 0 {
+            "AAAA"
+        } else {
+            "A"
+        }
+    }
+
+    /// The resolved address rendered as text.
+    pub(crate) fn addr(&self) -> String {
+        if self.is_ipv6 != 0 {
+            Ipv6Addr::from(self.ip6).to_string()
+        } else {
+            Ipv4Addr::from(self.ip4.to_ne_bytes()).to_string()
+        }
+    }
+}
+
+/// Decode a `DnsEvent` from a raw `events` ring-buffer record, or `None` if the
+/// slice is too short. Shared by the headless logger and the TUI feed.
+pub(crate) fn read_dns_event(data: &[u8]) -> Option<DnsEvent> {
+    if data.len() < size_of::<DnsEvent>() {
+        return None;
+    }
+    // SAFETY: `data` is at least as large as the struct, which mirrors the
+    // kernel-side C layout. Unaligned read since the ring buffer hands us an
+    // arbitrarily-aligned slice.
+    Some(unsafe { std::ptr::read_unaligned(data.as_ptr() as *const DnsEvent) })
 }
 
 // Mirror of dns_ip_key_t from dns_parser.h (the reverse cache key).
@@ -63,25 +103,28 @@ struct DnsRevValue {
 }
 
 /// CLOCK_MONOTONIC nanoseconds, matching the kernel's `bpf_ktime_get_ns`.
-fn monotonic_now_ns() -> u64 {
+pub(crate) fn monotonic_now_ns() -> u64 {
     let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-/// Dump the in-kernel reverse cache (address -> name), skipping expired entries.
-fn dump_cache(skel: &DnsParserSkel) -> Result<()> {
+/// One live entry of the reverse cache, decoded for display.
+pub(crate) struct ReverseEntry {
+    pub(crate) addr:     String,
+    pub(crate) name:     String,
+    pub(crate) ttl:      u32,
+    pub(crate) age_secs: u64,
+}
+
+/// Iterate the in-kernel reverse cache (address -> name) and return the live
+/// (non-expired) entries. Shared by `--dump-cache` and the TUI cache panel.
+pub(crate) fn live_reverse_entries(skel: &DnsParserSkel) -> Vec<ReverseEntry> {
     let now = monotonic_now_ns();
-    let mut count = 0u64;
-    info!("reverse DNS cache (address -> name):");
+    let mut out = Vec::new();
     for key in skel.maps.dns_reverse.keys() {
-        let Some(val) = skel
-            .maps
-            .dns_reverse
-            .lookup(&key, libbpf_rs::MapFlags::ANY)
-            .context("lookup dns_reverse")?
-        else {
-            continue; // evicted between keys() and lookup()
+        let Ok(Some(val)) = skel.maps.dns_reverse.lookup(&key, libbpf_rs::MapFlags::ANY) else {
+            continue; // evicted between keys() and lookup(), or lookup failed
         };
         if key.len() < size_of::<DnsIpKey>() || val.len() < size_of::<DnsRevValue>() {
             continue;
@@ -101,36 +144,82 @@ fn dump_cache(skel: &DnsParserSkel) -> Result<()> {
             Ipv4Addr::from([k.addr[0], k.addr[1], k.addr[2], k.addr[3]]).to_string()
         };
         let name_len = (v.name_len as usize).min(DNS_MAX_NAME_LEN);
-        let name = String::from_utf8_lossy(&v.name[..name_len]);
-        info!("  {addr} -> {name} (ttl={}s, age={}s)", v.ttl, age / 1_000_000_000);
-        count += 1;
+        let name = String::from_utf8_lossy(&v.name[..name_len]).into_owned();
+        out.push(ReverseEntry {
+            addr,
+            name,
+            ttl: v.ttl,
+            age_secs: age / 1_000_000_000,
+        });
     }
+    out
+}
+
+/// Dump the in-kernel reverse cache (address -> name), skipping expired entries.
+fn dump_cache(skel: &DnsParserSkel) -> Result<()> {
+    info!("reverse DNS cache (address -> name):");
+    let entries = live_reverse_entries(skel);
+    for e in &entries {
+        info!("  {} -> {} (ttl={}s, age={}s)", e.addr, e.name, e.ttl, e.age_secs);
+    }
+    let count = entries.len();
     info!("{count} live entr{}", if count == 1 { "y" } else { "ies" });
     Ok(())
 }
 
 fn print_dns_event(data: &[u8]) {
-    if data.len() < size_of::<DnsEvent>() {
+    let Some(ev) = read_dns_event(data) else {
         return;
-    }
-    let ev: DnsEvent = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const DnsEvent) };
-    let name_len = (ev.name_len as usize).min(DNS_MAX_NAME_LEN);
-    let name = String::from_utf8_lossy(&ev.name[..name_len]);
-    let (record_type, addr) = if ev.is_ipv6 != 0 {
-        ("AAAA", Ipv6Addr::from(ev.ip6).to_string())
-    } else {
-        ("A", Ipv4Addr::from(ev.ip4.to_ne_bytes()).to_string())
     };
     info!(
         "[txid={} answer={}] {} {} {} ttl={}",
-        ev.txid, ev.answer_idx, name, record_type, addr, ev.ttl
+        ev.txid,
+        ev.answer_idx,
+        ev.name(),
+        ev.record_type(),
+        ev.addr(),
+        ev.ttl
     );
 }
 
-struct Capture {
+pub(crate) struct Capture {
     qdcount: u16,
     ancount: u16,
     payload: Vec<u8>,
+}
+
+/// Build the `dns_capture_rb` ring-buffer callback: decode a raw DNS capture
+/// record, store it keyed by `txid_cpu`, and flush `payloads.json`. Shared by
+/// the headless loop and the TUI worker.
+pub(crate) fn capture_callback(
+    captures: Arc<Mutex<BTreeMap<String, Capture>>>,
+) -> impl FnMut(&[u8]) -> i32 {
+    move |data: &[u8]| -> i32 {
+        // txid(2) + cpu(2) + qdcount(2) + ancount(2) + len(2) + payload
+        if data.len() < 10 {
+            return 0;
+        }
+        let txid = u16::from_ne_bytes([data[0], data[1]]);
+        let cpu = u16::from_ne_bytes([data[2], data[3]]);
+        let qdcount = u16::from_ne_bytes([data[4], data[5]]);
+        let ancount = u16::from_ne_bytes([data[6], data[7]]);
+        let pay_len = u16::from_ne_bytes([data[8], data[9]]) as usize;
+        let end = (10 + pay_len).min(data.len());
+        let payload = data[10..end].to_vec();
+        let key = format!("{txid}_{cpu}");
+        let mut map = captures.lock().unwrap();
+        map.insert(
+            key.clone(),
+            Capture {
+                qdcount,
+                ancount,
+                payload,
+            },
+        );
+        write_payloads("payloads.json", &map);
+        debug!("captured {key} (q={qdcount} a={ancount} {pay_len} bytes)");
+        0
+    }
 }
 
 fn format_payload(payload: &[u8]) -> String {
@@ -145,7 +234,7 @@ fn format_payload(payload: &[u8]) -> String {
     lines.join(",\n")
 }
 
-fn write_payloads(path: &str, entries: &BTreeMap<String, Capture>) {
+pub(crate) fn write_payloads(path: &str, entries: &BTreeMap<String, Capture>) {
     let mut out = String::from("{\n    \"payloads\": {\n");
     let mut first = true;
     for (key, cap) in entries {
@@ -180,37 +269,53 @@ fn if_nametoindex(name: &str) -> Result<u32> {
 }
 
 fn main() -> Result<()> {
-    println!("dns-cache: a simple XDP-based DNS cache for testing and fuzzing");
-    Logger::try_with_env_or_str("info")?
-        .log_to_file(FileSpec::default().basename("dns-cache"))
-        .duplicate_to_stderr(Duplicate::All)
-        .start()?;
-
     let args: Vec<String> = std::env::args().collect();
+    let usage = format!("usage: {} [-v] [--dump-cache | --tui] <iface>", args[0]);
     let mut ifname = None;
     let mut debug_enabled = false;
     let mut dump_only = false;
+    let mut tui_enabled = false;
 
     for arg in args.iter().skip(1) {
         if arg == "-v" {
             debug_enabled = true;
         } else if arg == "--dump-cache" {
             dump_only = true;
+        } else if arg == "--tui" {
+            tui_enabled = true;
         } else if ifname.is_none() {
             ifname = Some(arg);
         } else {
             eprintln!("too many arguments");
-            eprintln!("usage: {} [-v] [--dump-cache] <iface>", args[0]);
+            eprintln!("{usage}");
             std::process::exit(1);
         }
     }
 
-    // --dump-cache reuses the pinned reverse map populated by the attached
-    // instance, so it does not need an interface.
-    if !dump_only && ifname.is_none() {
-        eprintln!("usage: {} [-v] [--dump-cache] <iface>", args[0]);
+    if dump_only && tui_enabled {
+        eprintln!("--dump-cache and --tui are mutually exclusive");
+        eprintln!("{usage}");
         std::process::exit(1);
     }
+
+    // --dump-cache reuses the pinned reverse map populated by the attached
+    // instance, so it does not need an interface. Every other mode attaches and
+    // therefore requires one.
+    if !dump_only && ifname.is_none() {
+        eprintln!("{usage}");
+        std::process::exit(1);
+    }
+
+    // The TUI owns the terminal, so log only to the file; stderr duplication
+    // would corrupt the alternate screen. Other modes keep duplicating to
+    // stderr for visibility.
+    let mut logger = Logger::try_with_env_or_str("info")?
+        .log_to_file(FileSpec::default().basename("dns-cache"));
+    if !tui_enabled {
+        println!("dns-cache: a simple XDP-based DNS cache for testing and fuzzing");
+        logger = logger.duplicate_to_stderr(Duplicate::All);
+    }
+    logger.start()?;
 
     let mut open_obj = std::mem::MaybeUninit::uninit();
     let builder = DnsParserSkelBuilder::default();
@@ -253,43 +358,33 @@ fn main() -> Result<()> {
             .with_context(|| format!("jmp_table[{idx}] := tail-call program"))?;
     }
 
+    let ifindex = ifindex as i32;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))
+            .context("set signal handler")?;
+    }
+
+    // --tui hands the loaded skeleton off to the interactive UI, which attaches
+    // XDP, polls the ring buffers, and snapshots the reverse cache on its own
+    // worker thread.
+    if tui_enabled {
+        return tui::run(skel, ifindex, stop);
+    }
+
     // attach xdp_dns_ingress
     let prog_fd = skel.progs.xdp_dns_ingress.as_fd();
     let xdp = libbpf_rs::Xdp::new(prog_fd);
-    xdp.attach(ifindex as i32, XdpFlags::UPDATE_IF_NOEXIST)
+    xdp.attach(ifindex, XdpFlags::UPDATE_IF_NOEXIST)
         .with_context(|| format!("bpf_xdp_attach({ifname})"))?;
 
     let captures: Arc<Mutex<BTreeMap<String, Capture>>> = Arc::new(Mutex::new(BTreeMap::new()));
-    let captures_cb = captures.clone();
 
     let mut rb_builder = RingBufferBuilder::new();
     rb_builder
-        .add(&skel.maps.dns_capture_rb, move |data: &[u8]| -> i32 {
-            // txid(2) + cpu(2) + qdcount(2) + ancount(2) + len(2) + payload
-            if data.len() < 10 {
-                return 0;
-            }
-            let txid = u16::from_ne_bytes([data[0], data[1]]);
-            let cpu = u16::from_ne_bytes([data[2], data[3]]);
-            let qdcount = u16::from_ne_bytes([data[4], data[5]]);
-            let ancount = u16::from_ne_bytes([data[6], data[7]]);
-            let pay_len = u16::from_ne_bytes([data[8], data[9]]) as usize;
-            let end = (10 + pay_len).min(data.len());
-            let payload = data[10..end].to_vec();
-            let key = format!("{txid}_{cpu}");
-            let mut map = captures_cb.lock().unwrap();
-            map.insert(
-                key.clone(),
-                Capture {
-                    qdcount,
-                    ancount,
-                    payload,
-                },
-            );
-            write_payloads("payloads.json", &map);
-            debug!("captured {key} (q={qdcount} a={ancount} {pay_len} bytes)");
-            0
-        })
+        .add(&skel.maps.dns_capture_rb, capture_callback(captures.clone()))
         .context("ringbuf add")?;
     rb_builder
         .add(&skel.maps.events, |data: &[u8]| -> i32 {
@@ -299,13 +394,6 @@ fn main() -> Result<()> {
         .context("events ringbuf add")?;
     let rb = rb_builder.build().context("ringbuf build")?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst))
-            .context("set signal handler")?;
-    }
-
     info!("attached xdp_dns_ingress to {ifname} (ifindex={ifindex}). Ctrl-C to detach.");
 
     while !stop.load(Ordering::SeqCst) {
@@ -313,7 +401,7 @@ fn main() -> Result<()> {
     }
 
     drop(rb);
-    let _ = xdp.detach(ifindex as i32, XdpFlags::UPDATE_IF_NOEXIST);
+    let _ = xdp.detach(ifindex, XdpFlags::UPDATE_IF_NOEXIST);
     write_payloads("payloads.json", &captures.lock().unwrap());
     Ok(())
 }
