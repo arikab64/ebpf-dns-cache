@@ -5,10 +5,8 @@
 
 char _license[] SEC("license") = "GPL";
 
-/* 
- * Global configuration. Set from user-space loader via skeleton rodata. 
- * 'volatile' prevents the compiler from optimizing away the check.
- */
+// Global configuration. Set from user-space loader via skeleton rodata. 
+// 'volatile' prevents the compiler from optimizing away the check.
 volatile const bool debug = false;
 
 #define bpf_printk0(fmt, ...) \
@@ -36,7 +34,8 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 4);    // PROG_PARSE_FQDN, PROG_WALK_QUESTION, PROG_WALK_ANSWER, PROG_EMIT_EVENTS
+    // PROG_PARSE_FQDN, PROG_WALK_QUESTION, PROG_WALK_ANSWER, PROG_EMIT_EVENTS
+    __uint(max_entries, 4);    
     __type(key, u32);
     __type(value, u32);
 } jmp_table SEC(".maps");
@@ -57,6 +56,27 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 20);
 } events SEC(".maps");
+
+// Reverse DNS cache: address -> name. One LRU entry per A/AAAA answer, keyed by
+// the resolved address; the enforcement fast path looks it up by destination IP.
+// Pinned by name so a separate BPF object can reopen the same map.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, DNS_CACHE_REV_ENTRIES);
+    __type(key,   dns_ip_key_t);
+    __type(value, dns_rev_value_t);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} dns_reverse SEC(".maps");
+
+// Per-CPU scratch for building a reverse value: dns_rev_value_t (272 B) is too
+// large for the XDP stack, so stage it here before bpf_map_update_elem copies it
+// into dns_reverse. Single-threaded per CPU within the tail-call chain.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, dns_rev_value_t);
+} rev_scratch SEC(".maps");
 
 
 static __always_inline dns_parser_state_t *get_state(void)
@@ -160,6 +180,33 @@ static __always_inline int cache_lookup(dns_parser_state_t *st,
     return 0;
 }
 
+// Write one reverse cache entry (address -> name) for the answer just parsed.
+// Reuses the values already staged in the event — no re-parsing and, crucially,
+// no second variable-offset name loop (that doubles the verifier's state
+// exploration and blows the instruction budget). `addr`/`name` are read from the
+// event (a map value) at constant offsets, so the whole helper is loop-free.
+// `name` is already lowercased by walk_answer's copy loop.
+static __always_inline void cache_record(u8 is_ipv6, const u8 *addr, u32 addr_len,
+                                         const char *name, u16 nl, u32 ttl)
+{
+    dns_ip_key_t ik;
+    __builtin_memset(&ik, 0, sizeof ik);   // whole key zeroed: LRU hashes every byte
+    ik.is_ipv6 = is_ipv6;
+    __builtin_memcpy(ik.addr, addr, addr_len);   // addr_len is constant at the inline site
+
+    u32 zero = 0;
+    dns_rev_value_t *rv = bpf_map_lookup_elem(&rev_scratch, &zero);
+    if (!rv)
+        return;
+    __builtin_memset(rv, 0, sizeof *rv);
+    rv->inserted_ns = bpf_ktime_get_ns();
+    rv->ttl         = ttl;
+    rv->name_len    = nl;
+    __builtin_memcpy(rv->name, name, sizeof rv->name);  // fixed-size copy of the staged name
+
+    bpf_map_update_elem(&dns_reverse, &ik, rv, BPF_ANY);
+}
+
 
 SEC("xdp")
 int xdp_dns_ingress(struct xdp_md *ctx)
@@ -179,7 +226,7 @@ int xdp_dns_ingress(struct xdp_md *ctx)
     if (ip->protocol != IPPROTO_UDP)
         return XDP_PASS;
 
-    /* IHL is in 32-bit words; honor it so options don't desync the offset. */
+    // IHL is in 32-bit words; honor it so options don't desync the offset. 
     u32 ihl = ip->ihl * 4;
     if (ihl < sizeof(*ip))
         return XDP_PASS;
@@ -555,7 +602,13 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
                 if (si >= DNS_NAME_BUF)
                     break;
                 BARRIER(si);
-                ev->name[i] = st->name_buf[si & (DNS_NAME_BUF - 1)];
+                // Lowercase as we copy: DNS is case-insensitive, so normalizing
+                // here gives both the debug event and the reverse cache (which
+                // memcpy's this buffer) a single canonical owner name.
+                char c = st->name_buf[si & (DNS_NAME_BUF - 1)];
+                if (c >= 'A' && c <= 'Z')
+                    c += 32;
+                ev->name[i] = c;
             }
 
             if (nl <= DNS_MAX_NAME_LEN)
@@ -592,6 +645,10 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
 SEC("xdp")
 int xdp_dns_emit_events(struct xdp_md *ctx)
 {
+    dns_parser_state_t *st = get_state();
+    if (!st)
+        return XDP_PASS;
+
     dns_event_batch_t *batch = get_batch();
     if (!batch)
         return XDP_PASS;
@@ -600,18 +657,30 @@ int xdp_dns_emit_events(struct xdp_md *ctx)
     if (n > DNS_MAX_PENDING_EVENTS)
         n = DNS_MAX_PENDING_EVENTS;
 
-    bpf_printk0("[dns-parser] emit_events: draining %d event(s)\n", n);
+    bpf_printk0("[dns-parser-%d/%d] emit_events: draining %d event(s)", 
+            st->id, st->cpu, n);
 
     for (u32 i = 0; i < DNS_MAX_PENDING_EVENTS; i++)
     {
         if (i >= n)
             break;
 
+        dns_event_t *e = &batch->events[i];
+
+        // Drain into the events ring buffer (debug trace). A full ring buffer
+        // only drops the trace; the cache write below still happens.
         dns_event_t *ev = bpf_ringbuf_reserve(&events, sizeof(dns_event_t), 0);
-        if (!ev)
-            break;
-        __builtin_memcpy(ev, &batch->events[i], sizeof(dns_event_t));
-        bpf_ringbuf_submit(ev, 0);
+        if (ev) {
+            __builtin_memcpy(ev, e, sizeof(dns_event_t));
+            bpf_ringbuf_submit(ev, 0);
+        }
+
+        // Reverse cache write (address -> name), reusing the staged event's
+        // already-lowercased name and resolved address.
+        if (e->is_ipv6)
+            cache_record(1, e->ip6, 16, e->name, e->name_len, e->ttl);
+        else
+            cache_record(0, (const u8 *)&e->ip4, 4, e->name, e->name_len, e->ttl);
     }
 
     batch->n = 0;

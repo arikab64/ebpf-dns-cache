@@ -118,6 +118,55 @@ impl DnsEvent {
     }
 }
 
+// Mirror of `dns_ip_key_t` from src/bpf/dns_parser.h (reverse cache key).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnsIpKey {
+    is_ipv6: u8,
+    _pad:    [u8; 3],
+    addr:    [u8; 16],
+}
+
+// Mirror of `dns_rev_value_t` from src/bpf/dns_parser.h (reverse cache value).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnsRevValue {
+    inserted_ns: u64,
+    ttl:         u32,
+    name_len:    u16,
+    _pad:        u16,
+    name:        [u8; DNS_MAX_NAME_LEN + 1],
+}
+
+impl DnsRevValue {
+    fn name(&self) -> String {
+        let n = (self.name_len as usize).min(DNS_MAX_NAME_LEN);
+        String::from_utf8_lossy(&self.name[..n]).into_owned()
+    }
+}
+
+/// Look up an IPv4 address in the `dns_reverse` cache, returning its value.
+fn lookup_reverse_v4(skel: &DnsParserSkel<'_>, ip: [u8; 4]) -> Option<DnsRevValue> {
+    let mut key = DnsIpKey {
+        is_ipv6: 0,
+        _pad:    [0; 3],
+        addr:    [0; 16],
+    };
+    key.addr[..4].copy_from_slice(&ip);
+    // SAFETY: DnsIpKey is repr(C) and mirrors the kernel key byte-for-byte.
+    let key_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(&key as *const _ as *const u8, size_of::<DnsIpKey>()) };
+    let raw = skel
+        .maps
+        .dns_reverse
+        .lookup(key_bytes, MapFlags::ANY)
+        .expect("lookup dns_reverse")?;
+    assert!(raw.len() >= size_of::<DnsRevValue>());
+    // SAFETY: `raw` is at least as large as the struct, which mirrors the
+    // kernel-side C layout. Unaligned read since `raw` is a Vec<u8>.
+    Some(unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const DnsRevValue) })
+}
+
 /// Drains the `events` ring buffer one `DnsEvent` at a time.
 ///
 /// libbpf's ring buffer only exposes a callback-driven `consume`, so we attach
@@ -642,4 +691,35 @@ fn parses_dns_response() {
         reader.next_event().is_none(),
         "ring buffer should be empty after the four A answers"
     );
+}
+
+#[test]
+fn caches_reverse_addresses() {
+    // The same grammarly response should populate the reverse cache: each of the
+    // four A answers writes an `address -> name` entry keyed by the resolved IP.
+    let mut harness = Harness::new();
+    let skel = harness.load();
+
+    let packet = build_dns_response(&DNS_RESPONSE);
+    assert_eq!(run_ingress(&skel, &packet), XDP_PASS, "ingress should pass");
+
+    let expected_ips = [
+        [13, 224, 245, 108],
+        [13, 224, 245, 123],
+        [13, 224, 245, 61],
+        [13, 224, 245, 78],
+    ];
+
+    for ip in &expected_ips {
+        let v = lookup_reverse_v4(&skel, *ip)
+            .unwrap_or_else(|| panic!("reverse cache missing entry for {ip:?}"));
+        assert_eq!(v.name(), "d27xxe7juh1us6.cloudfront.net", "cached owner name");
+        assert_eq!(
+            v.name_len as usize,
+            "d27xxe7juh1us6.cloudfront.net".len(),
+            "cached name length"
+        );
+        assert_eq!(v.ttl, 28, "cached TTL");
+        assert_ne!(v.inserted_ns, 0, "inserted_ns stamped");
+    }
 }

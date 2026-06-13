@@ -44,6 +44,71 @@ struct DnsEvent {
     name:       [u8; DNS_MAX_NAME_LEN + 1],
 }
 
+// Mirror of dns_ip_key_t from dns_parser.h (the reverse cache key).
+#[repr(C)]
+struct DnsIpKey {
+    is_ipv6: u8,
+    _pad:    [u8; 3],
+    addr:    [u8; 16],
+}
+
+// Mirror of dns_rev_value_t from dns_parser.h (the reverse cache value).
+#[repr(C)]
+struct DnsRevValue {
+    inserted_ns: u64,
+    ttl:         u32,
+    name_len:    u16,
+    _pad:        u16,
+    name:        [u8; DNS_MAX_NAME_LEN + 1],
+}
+
+/// CLOCK_MONOTONIC nanoseconds, matching the kernel's `bpf_ktime_get_ns`.
+fn monotonic_now_ns() -> u64 {
+    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Dump the in-kernel reverse cache (address -> name), skipping expired entries.
+fn dump_cache(skel: &DnsParserSkel) -> Result<()> {
+    let now = monotonic_now_ns();
+    let mut count = 0u64;
+    info!("reverse DNS cache (address -> name):");
+    for key in skel.maps.dns_reverse.keys() {
+        let Some(val) = skel
+            .maps
+            .dns_reverse
+            .lookup(&key, libbpf_rs::MapFlags::ANY)
+            .context("lookup dns_reverse")?
+        else {
+            continue; // evicted between keys() and lookup()
+        };
+        if key.len() < size_of::<DnsIpKey>() || val.len() < size_of::<DnsRevValue>() {
+            continue;
+        }
+        let k: DnsIpKey = unsafe { std::ptr::read_unaligned(key.as_ptr() as *const DnsIpKey) };
+        let v: DnsRevValue =
+            unsafe { std::ptr::read_unaligned(val.as_ptr() as *const DnsRevValue) };
+
+        let age = now.saturating_sub(v.inserted_ns);
+        if age > v.ttl as u64 * 1_000_000_000 {
+            continue; // expired -> treat as a miss
+        }
+
+        let addr = if k.is_ipv6 != 0 {
+            Ipv6Addr::from(k.addr).to_string()
+        } else {
+            Ipv4Addr::from([k.addr[0], k.addr[1], k.addr[2], k.addr[3]]).to_string()
+        };
+        let name_len = (v.name_len as usize).min(DNS_MAX_NAME_LEN);
+        let name = String::from_utf8_lossy(&v.name[..name_len]);
+        info!("  {addr} -> {name} (ttl={}s, age={}s)", v.ttl, age / 1_000_000_000);
+        count += 1;
+    }
+    info!("{count} live entr{}", if count == 1 { "y" } else { "ies" });
+    Ok(())
+}
+
 fn print_dns_event(data: &[u8]) {
     if data.len() < size_of::<DnsEvent>() {
         return;
@@ -124,28 +189,28 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut ifname = None;
     let mut debug_enabled = false;
+    let mut dump_only = false;
 
     for arg in args.iter().skip(1) {
         if arg == "-v" {
             debug_enabled = true;
+        } else if arg == "--dump-cache" {
+            dump_only = true;
         } else if ifname.is_none() {
             ifname = Some(arg);
         } else {
             eprintln!("too many arguments");
-            eprintln!("usage: {} [-v] <iface>", args[0]);
+            eprintln!("usage: {} [-v] [--dump-cache] <iface>", args[0]);
             std::process::exit(1);
         }
     }
 
-    let ifname = match ifname {
-        Some(n) => n,
-        None => {
-            eprintln!("usage: {} [-v] <iface>", args[0]);
-            std::process::exit(1);
-        }
-    };
-
-    let ifindex = if_nametoindex(ifname)?;
+    // --dump-cache reuses the pinned reverse map populated by the attached
+    // instance, so it does not need an interface.
+    if !dump_only && ifname.is_none() {
+        eprintln!("usage: {} [-v] [--dump-cache] <iface>", args[0]);
+        std::process::exit(1);
+    }
 
     let mut open_obj = std::mem::MaybeUninit::uninit();
     let builder = DnsParserSkelBuilder::default();
@@ -160,6 +225,16 @@ fn main() -> Result<()> {
     }
 
     let skel = open_skel.load().context("failed to load skeleton")?;
+
+    // --dump-cache: load reuses the pinned reverse map, dump it, and exit
+    // without attaching.
+    if dump_only {
+        dump_cache(&skel)?;
+        return Ok(());
+    }
+
+    let ifname = ifname.expect("ifname required when not dumping");
+    let ifindex = if_nametoindex(ifname)?;
 
     // Seed the tail-call program array: each parser stage is reachable from the
     // others via jmp_table[PROG_*].

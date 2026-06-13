@@ -128,6 +128,26 @@ typedef struct dns_event_batch {
 } dns_event_batch_t;
 
 
+// In-kernel reverse DNS cache: address -> name, written per A/AAAA answer and
+// queried by destination IP for packet-time enforcement. LRU bounds memory; the
+// inserted_ns/ttl stamp lets any reader treat an expired entry as a miss.
+#define DNS_CACHE_REV_ENTRIES   16384
+
+typedef struct dns_ip_key {             // hash key — MUST be fully zeroed before use
+    u8  is_ipv6;                        // 0 = A (v4), 1 = AAAA (v6)
+    u8  _pad[3];
+    u8  addr[16];                       // network order; v4 in addr[0..4], v6 in addr[0..16]
+} dns_ip_key_t;
+
+typedef struct dns_rev_value {
+    unsigned long long inserted_ns;     // bpf_ktime_get_ns() at last write
+    u32  ttl;                           // record TTL (seconds)
+    u16  name_len;                      // owner name length
+    u16  _pad;
+    char name[DNS_MAX_NAME_LEN + 1];    // lowercased owner FQDN, zero-padded
+} dns_rev_value_t;
+
+
 typedef enum dns_parser_error_e {
     DNS_PARSE_SUCCESS = 0,
     DNS_PARSE_ERR_NO_STATE,
