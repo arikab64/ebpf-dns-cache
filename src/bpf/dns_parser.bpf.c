@@ -500,6 +500,10 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
             ev->name_len   = nl;
             ev->txid       = st->id;
             ev->answer_idx = st->answer_idx;
+            // TTL sits at off+4 (after TYPE+CLASS); the off+10 bounds check
+            // above already covers these 4 bytes. bpf_ntohl -> host order.
+            ev->ttl        = bpf_ntohl(*(u32 *)(data + off + 4));
+
             if (type == DNS_TYPE_A)
             {
                 if (data + rdata + 4 > data_end)
@@ -535,12 +539,27 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
                 BARRIER(si);
                 ev->name[i] = st->name_buf[si & (DNS_NAME_BUF - 1)];
             }
+
             if (nl <= DNS_MAX_NAME_LEN)
                 ev->name[nl] = '\0';
+
+            bpf_printk0("[dns-parser-%d/%d] walk_answer %d: name=%s, ttl=%d\n",
+                       st->id, st->cpu, ev->answer_idx, ev->name, ev->ttl);
+
+            // print the IP in hex for debugging
+            if (ev->is_ipv6) {
+                bpf_printk0("[dns-parser-%d/%d] walk_answer %d: IPv6=%02x%02x:%02x...",
+                           st->id, st->cpu, ev->answer_idx,
+                           ev->ip6[0], ev->ip6[1], ev->ip6[2]);
+            }
+            else {
+                bpf_printk0("[dns-parser-%d/%d] walk_answer %d: IPv4=%pI4",
+                           st->id, st->cpu, ev->answer_idx, &ev->ip4);
+            }
+
             bpf_ringbuf_submit(ev, 0);
         }
     }
-
     
     st->packet_offset = rdata + rdlen;
     st->answer_idx += 1;

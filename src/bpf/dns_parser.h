@@ -113,6 +113,7 @@ typedef struct dns_event {
     u8  _pad[3];
     u32 ip4;                      // network byte order, valid if !is_ipv6 
     u8  ip6[16];                  // valid if is_ipv6 
+    u32 ttl;                      // record TTL in seconds
     char  name[DNS_MAX_NAME_LEN + 1];  /* answer owner FQDN */
 } dns_event_t;
 

@@ -39,6 +39,7 @@ struct DnsEvent {
     _pad:       [u8; 3],
     ip4:        u32,
     ip6:        [u8; 16],
+    ttl:        u32,
     name:       [u8; DNS_MAX_NAME_LEN + 1],
 }
 
@@ -55,8 +56,8 @@ fn print_dns_event(data: &[u8]) {
         ("A", Ipv4Addr::from(ev.ip4.to_ne_bytes()).to_string())
     };
     info!(
-        "[txid={} answer={}] {} {} {}",
-        ev.txid, ev.answer_idx, name, record_type, addr
+        "[txid={} answer={}] {} {} {} ttl={}",
+        ev.txid, ev.answer_idx, name, record_type, addr, ev.ttl
     );
 }
 
