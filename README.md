@@ -204,7 +204,12 @@ sudo ./target/release/ebpf-dns-cache --tui eth0
 ```
 
 - **Events** — a live feed of parsed DNS answers (local arrival time `HH:MM:SS`, name, record type, address, TTL, transaction id / answer index) as they arrive on the `events` ring buffer. By default the feed is sorted newest-first (most recent at the top) and follows new arrivals; press `l` at any time to jump back to this latest-first view.
+
+  ![Events panel](assets/events-tab.png)
+
 - **Cache** — the in-kernel `dns_reverse` map (`Time` — local insertion time `HH:MM:SS`, derived from age at snapshot — `address → name`, TTL, age, and `Left` — the time-to-live remaining, computed as `TTL − age`), re-read every ~5 seconds (or on demand with `r`), with expired entries filtered out.
+
+  ![Cache panel](assets/cache-tab.png)
 
 A background worker thread owns the skeleton and ring buffers and snapshots the cache; the main thread renders and handles input. In TUI mode logging is file-only (`dns-cache_*.log`) so it can't corrupt the screen. Payload capture to `payloads.json` is toggled live with `p` (initialised from the `--payload` flag).
 
