@@ -10,31 +10,29 @@ This project attaches an XDP program to a network interface and parses every inc
 
 ## Architecture
 
-```
-NIC → XDP hook → [xdp_dns_ingress]
-                      │
-                      ├─ Non-DNS?  → XDP_PASS (unchanged)
-                      │
-                      └─ DNS response:
-                           │
-                           ├─ Raw payload → dns_capture_rb (debug)
-                           │
-                           └─ tail-call chain:
-                                ┌──────────────────────┐
-                                │  xdp_dns_parse_fqdn  │◄─┐
-                                │  (label parser)      │  │ recursion via
-                                └──────────┬───────────┘  │ tail-call
-                                           │              │
-                              ┌────────────┴─────────┐    │
-                              ▼                       ▼    │
-                     xdp_dns_walk_question   xdp_dns_walk_answer
-                     (skip questions)        (emit A/AAAA events)
-                                                      │
-                                                      ▼
-                                               events ringbuf
-                                                      │
-                                               Rust user space
-                                               (print / store)
+```mermaid
+flowchart TD
+    NIC[NIC] --> ingress["xdp_dns_ingress"]
+    ingress -->|"Non-DNS"| PASS["XDP_PASS (unchanged)"]
+    ingress -->|"DNS response: raw payload"| capture["dns_capture_rb (debug)"]
+    ingress -->|"DNS response: tail-call chain"| fqdn
+
+    subgraph chain["tail-call chain"]
+        fqdn["xdp_dns_parse_fqdn (label parser)"]
+        question["xdp_dns_walk_question (skip questions)"]
+        answer["xdp_dns_walk_answer (parse A/AAAA records)"]
+        emit["xdp_dns_emit_events"]
+
+        fqdn --> question
+        fqdn --> answer
+        question -.->|"re-enter (tail-call)"| fqdn
+        answer -.->|"re-enter (tail-call)"| fqdn
+        answer --> emit
+    end
+
+    emit --> events["events ringbuf"]
+    emit --> reverse["dns_reverse LRU: addr to name cache (pinned, in-kernel)"]
+    events --> userspace["Rust user space (print / store)"]
 ```
 
 ### Why XDP?
@@ -49,10 +47,13 @@ XDP (eXpress Data Path) runs eBPF programs at the earliest point in the receive 
 
 The eBPF verifier limits a single program to a bounded number of instructions. Parsing a DNS response requires walking a variable number of questions and answers, each with a variable-length name — too complex for one program. Tail-calls solve this: each logical stage is a separate eBPF program that jumps into the next via a `BPF_MAP_TYPE_PROG_ARRAY` table, sharing state through a per-CPU map. The chain is:
 
-```
-ingress → parse_fqdn → walk_question ──► walk_answer
-                ▲            │                │
-                └────────────┘   (loop)       │ (loop)
+```mermaid
+flowchart LR
+    ingress --> parse_fqdn
+    parse_fqdn --> walk_question
+    walk_question -->|"loop"| walk_answer
+    walk_question -.->|"re-enter"| parse_fqdn
+    walk_answer -.->|"loop / re-enter"| parse_fqdn
 ```
 
 `parse_fqdn` can be re-entered from either walker, allowing names in both the question section (for context) and the answer section to be parsed with the same code.
@@ -76,6 +77,33 @@ struct dns_parser_state {
     frame_t stack[16];            // call stack for pointer chains
 };
 ```
+
+### Reverse cache (address → name)
+
+Emitting events to user space is enough for observation, but enforcement needs to answer the inverse question at packet time: *given a destination IP, what name was it resolved from?* To support that, the final tail-call stage (`xdp_dns_emit_events`) also writes each A/AAAA record into an in-kernel **reverse cache** — an `BPF_MAP_TYPE_LRU_HASH` keyed by address, holding the owner name:
+
+```c
+typedef struct dns_ip_key {          // key — fully zeroed before use (LRU hashes every byte)
+    u8  is_ipv6;                     // 0 = A (v4), 1 = AAAA (v6)
+    u8  _pad[3];
+    u8  addr[16];                    // network order; v4 in addr[0..4], v6 in addr[0..16]
+} dns_ip_key_t;
+
+typedef struct dns_rev_value {
+    u64  inserted_ns;                // bpf_ktime_get_ns() at last write
+    u32  ttl;                        // record TTL (seconds)
+    u16  name_len;
+    u16  _pad;
+    char name[256];                  // owner FQDN, zero-padded
+} dns_rev_value_t;
+```
+
+Design notes:
+
+- **LRU**, not a plain hash: the map is bounded at `DNS_CACHE_REV_ENTRIES` (16384) entries, and the kernel evicts the least-recently-used entry when it fills, so memory is capped without any user-space reaping.
+- **TTL stamping**: each entry records `inserted_ns` and the record's `ttl`. The LRU never expires entries on its own, so any reader compares `bpf_ktime_get_ns()` against `inserted_ns + ttl` and treats an aged-out entry as a miss.
+- **Pinned by name** (`LIBBPF_PIN_BY_NAME`): the map lives at `/sys/fs/bpf/dns_reverse`, so a separate process can reopen the exact same map without attaching its own XDP program — this is what `--dump-cache` (below) relies on.
+- The value struct (272 B) is too large for the XDP stack, so it is staged in a per-CPU scratch map (`rev_scratch`) and copied into `dns_reverse` by `bpf_map_update_elem`.
 
 ## DNS Name Parsing
 
@@ -145,10 +173,13 @@ make test-one TEST=parses_multi_label_fqdn
 ## Usage
 
 ```bash
-sudo ./target/debug/ebpf-dns-cache <interface>
+sudo ./target/debug/ebpf-dns-cache [-v] [--dump-cache] <interface>
 # e.g.
 sudo ./target/debug/ebpf-dns-cache eth0
 ```
+
+- `-v` enables verbose BPF debug logging.
+- `--dump-cache` prints the current reverse cache and exits (see below). An interface is not required in this mode.
 
 Example output:
 
@@ -161,6 +192,23 @@ INFO [loader] [txid=2976 answer=0] connectivity-check.ubuntu.com AAAA 2620:2d:40
 
 Structured logs go to `dns-cache_YYYY-MM-DD_HH-MM-SS.log`. Raw DNS payloads (for debugging or test generation) are written to `payloads.json`.
 
+### Dumping the reverse cache
+
+While an instance is attached and observing traffic, it populates the pinned `dns_reverse` map (see [Reverse cache](#reverse-cache-address--name)). A second invocation with `--dump-cache` reopens that same pinned map, prints every live (non-expired) `address → name` entry, and exits without attaching:
+
+```bash
+sudo ./target/debug/ebpf-dns-cache --dump-cache
+```
+
+```
+INFO [loader] reverse DNS cache (address -> name):
+INFO [loader]   93.184.216.34 -> api.example.com (ttl=300s, age=12s)
+INFO [loader]   2620:2d:4000:1::17 -> connectivity-check.ubuntu.com (ttl=60s, age=4s)
+INFO [loader] 2 live entries
+```
+
+Entries whose age exceeds their TTL are skipped (treated as a miss), so the dump reflects only currently-valid mappings.
+
 ## Kernel requirements
 
 | Feature | Minimum kernel |
@@ -168,6 +216,7 @@ Structured logs go to `dns-cache_YYYY-MM-DD_HH-MM-SS.log`. Raw DNS payloads (for
 | XDP | 4.8 |
 | `BPF_MAP_TYPE_PERCPU_ARRAY` | 4.6 |
 | `BPF_MAP_TYPE_PROG_ARRAY` (tail-calls) | 4.2 |
+| `BPF_MAP_TYPE_LRU_HASH` (reverse cache) | 4.10 |
 | `BPF_MAP_TYPE_RINGBUF` | 5.8 |
 | BTF (for `vmlinux.h`) | 5.2 |
 
