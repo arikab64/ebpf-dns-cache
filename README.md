@@ -130,22 +130,6 @@ Naively following every pointer by re-parsing from the target offset would be O(
 
 This makes pointer resolution O(1) after the first parse.
 
-### Verifier workarounds
-
-The eBPF verifier tracks the range of every scalar value and rejects programs that perform arithmetic it cannot prove is bounded. The DNS parser is inherently variable-length, which creates friction. Two patterns appear throughout the C code:
-
-```c
-// Hide a value's provenance so the verifier treats it as an unknown scalar,
-// forcing subsequent masks to be the sole proof of boundedness.
-#define BARRIER(var) asm volatile("" : "+r"(var))
-
-// After BARRIER, mask to prove the value fits in a buffer index.
-cursor = (cursor + label_len) & (DNS_NAME_BUF - 1);
-```
-
-Loop bodies are unrolled with `#pragma clang loop unroll(full)` where the iteration count is known at compile time.
-
-
 ## Build
 
 Requirements: `clang`, `llvm`, `bpftool`, Rust 1.70+, kernel 5.8+.
@@ -218,12 +202,12 @@ Entries whose age exceeds their TTL are skipped (treated as a miss), so the dump
 sudo ./target/release/ebpf-dns-cache --tui eth0
 ```
 
-- **Events** — a live, tail-following feed of parsed DNS answers (name, record type, address, TTL, transaction id / answer index) as they arrive on the `events` ring buffer.
-- **Cache** — the in-kernel `dns_reverse` map (`address → name`, TTL, age), re-read every ~5 seconds (or on demand with `r`), with expired entries filtered out.
+- **Events** — a live feed of parsed DNS answers (local arrival time `HH:MM:SS`, name, record type, address, TTL, transaction id / answer index) as they arrive on the `events` ring buffer. By default the feed is sorted newest-first (most recent at the top) and follows new arrivals; press `l` at any time to jump back to this latest-first view.
+- **Cache** — the in-kernel `dns_reverse` map (`Time` — local insertion time `HH:MM:SS`, derived from age at snapshot — `address → name`, TTL, age, and `Left` — the time-to-live remaining, computed as `TTL − age`), re-read every ~5 seconds (or on demand with `r`), with expired entries filtered out.
 
 A background worker thread owns the skeleton and ring buffers and snapshots the cache; the main thread renders and handles input. In TUI mode logging is file-only (`dns-cache_*.log`) so it can't corrupt the screen, and `payloads.json` is still written.
 
-Both panels support **filtering** and **sorting**. The filter is a case-insensitive substring matched against both the name and the address; sorting cycles through the panel's columns (the sorted column is marked with `↑`/`↓` in its header). Sorting the Events feed reorders the buffered rows and suspends tail-following until you turn the sort back off (or press `G`).
+Both panels support **filtering** and **sorting**. The filter is a case-insensitive substring matched against both the name and the address; sorting cycles through the panel's columns (the sorted column is marked with `↑`/`↓` in its header). The Events feed starts sorted by `Time` descending (newest at the top) and follows new arrivals there; choosing any other sort column or direction suspends following until you press `l` to return to the default latest-first view.
 
 Keybindings:
 
@@ -235,9 +219,10 @@ Keybindings:
 | `v` | cycle IP family filter (all → v4 → v6) |
 | `s` | cycle the active panel's sort column (off → first → … → off) |
 | `S` | toggle sort direction (ascending / descending) |
+| `l` | reset the Events feed to the default latest-first view (`Time ↓`) and resume following |
 | `↑` / `↓`, `PgUp` / `PgDn` | scroll the active panel (PgUp/PgDn by 10 rows) |
-| `g` / `G` | jump to top / bottom (`G` resumes following the feed) |
-| `Space` / `p` | pause/resume the feed (also auto-paused when you scroll up) |
+| `g` / `G` | jump to top / bottom (top is the newest event; `g` resumes following) |
+| `Space` / `p` | pause/resume the feed (also auto-paused when you scroll) |
 | `r` | force an immediate cache refresh |
 | `?` / `h` | toggle the help overlay |
 | `q` / `Esc` / `Ctrl-C` | quit (detaches XDP and restores the terminal) |
@@ -256,3 +241,21 @@ The footer shows live/paused state, the active sort, the active filter, current 
 | BTF (for `vmlinux.h`) | 5.2 |
 
 Linux 5.8 or later is recommended.
+
+### Verifier workarounds
+
+The eBPF verifier tracks the range of every scalar value and rejects programs that perform arithmetic it cannot prove is bounded. The DNS parser is inherently variable-length, which creates friction. Two patterns appear throughout the C code:
+
+```c
+// Hide a value's provenance so the verifier treats it as an unknown scalar,
+// forcing subsequent masks to be the sole proof of boundedness.
+#define BARRIER(var) asm volatile("" : "+r"(var))
+
+// After BARRIER, mask to prove the value fits in a buffer index.
+cursor = (cursor + label_len) & (DNS_NAME_BUF - 1);
+```
+
+Loop bodies are unrolled with `#pragma clang loop unroll(full)` where the iteration count is known at compile time.
+
+
+

@@ -28,8 +28,8 @@ use ratatui::{Frame, Terminal};
 
 use crate::dns_parser::DnsParserSkel;
 use crate::{
-    capture_callback, live_reverse_entries, monotonic_now_ns, read_dns_event, write_payloads,
-    Capture, DnsEvent, ReverseEntry,
+    capture_callback, live_reverse_entries, local_hms, monotonic_now_ns, read_dns_event,
+    write_payloads, Capture, DnsEvent, ReverseEntry,
 };
 
 /// Maximum number of feed rows retained in memory.
@@ -41,11 +41,17 @@ const FEED_CHAN_CAP: usize = 4096;
 
 /// Column headers / sort keys for each panel (index order matches the rendered
 /// columns and [`cmp_event`] / [`cmp_cache`]).
-const EVENTS_COLS: [&str; 5] = ["Name", "Type", "Address", "TTL", "TxID/Ans"];
-const CACHE_COLS: [&str; 4] = ["Address", "Name", "TTL", "Age"];
+const EVENTS_COLS: [&str; 6] = ["Time", "Name", "Type", "Address", "TTL", "TxID/Ans"];
+const CACHE_COLS: [&str; 6] = ["Time", "Address", "Name", "TTL", "Age", "Left"];
 
 /// One decoded DNS answer, owned so it can cross the channel to the UI thread.
 struct FeedEvent {
+    /// Local arrival time, formatted `HH:MM:SS` for display.
+    time:        String,
+    /// Monotonic insertion order, assigned by [`App::push_event`]. Used as the
+    /// sort key for the Time column so ordering is stable and survives ties /
+    /// midnight rollover that the formatted `time` string can't express.
+    seq:         u64,
     name:        String,
     record_type: &'static str,
     addr:        String,
@@ -57,6 +63,8 @@ struct FeedEvent {
 impl From<&DnsEvent> for FeedEvent {
     fn from(ev: &DnsEvent) -> Self {
         FeedEvent {
+            time:        local_hms(),
+            seq:         0, // assigned on push into the feed
             name:        ev.name(),
             record_type: ev.record_type(),
             addr:        ev.addr(),
@@ -67,13 +75,13 @@ impl From<&DnsEvent> for FeedEvent {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Events,
     Cache,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SortDir {
     Asc,
     Desc,
@@ -143,20 +151,30 @@ fn matches_filter(query: &str, name: &str, addr: &str) -> bool {
 
 fn cmp_event(a: &FeedEvent, b: &FeedEvent, col: usize) -> std::cmp::Ordering {
     match col {
-        0 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        1 => a.record_type.cmp(b.record_type),
-        2 => a.addr.cmp(&b.addr),
-        3 => a.ttl.cmp(&b.ttl),
+        0 => a.seq.cmp(&b.seq), // Time: order by arrival, not the formatted string
+        1 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        2 => a.record_type.cmp(b.record_type),
+        3 => a.addr.cmp(&b.addr),
+        4 => a.ttl.cmp(&b.ttl),
         _ => (a.txid, a.answer_idx).cmp(&(b.txid, b.answer_idx)),
     }
 }
 
+/// Seconds left before an entry's TTL elapses (`TTL - age`, clamped at 0).
+fn remaining_secs(e: &ReverseEntry) -> u64 {
+    (e.ttl as u64).saturating_sub(e.age_secs)
+}
+
 fn cmp_cache(a: &ReverseEntry, b: &ReverseEntry, col: usize) -> std::cmp::Ordering {
     match col {
-        0 => a.addr.cmp(&b.addr),
-        1 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        2 => a.ttl.cmp(&b.ttl),
-        _ => a.age_secs.cmp(&b.age_secs),
+        // Time (insertion): order by age so it's monotonic and midnight-safe.
+        // A smaller age is a more recent timestamp, so reverse the comparison.
+        0 => b.age_secs.cmp(&a.age_secs),
+        1 => a.addr.cmp(&b.addr),
+        2 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        3 => a.ttl.cmp(&b.ttl),
+        4 => a.age_secs.cmp(&b.age_secs),
+        _ => remaining_secs(a).cmp(&remaining_secs(b)),
     }
 }
 
@@ -191,6 +209,8 @@ struct App {
     /// order. Rebuilt each frame by [`App::rebuild_views`].
     events_view:  Vec<usize>,
     cache_view:   Vec<usize>,
+    /// Monotonic counter stamped onto each event as it enters the feed.
+    seq_counter:  u64,
 }
 
 impl App {
@@ -207,14 +227,22 @@ impl App {
             filtering:   false,
             ip_filter:   IpFilter::Both,
             show_help:   false,
-            events_sort: SortState::default(),
+            // Default to the "latest first" view: sort by Time (col 0), newest
+            // at the top. `l` resets to exactly this.
+            events_sort: SortState {
+                col: Some(0),
+                dir: SortDir::Desc,
+            },
             cache_sort:  SortState::default(),
             events_view: Vec::new(),
             cache_view:  Vec::new(),
+            seq_counter: 0,
         }
     }
 
-    fn push_event(&mut self, ev: FeedEvent) {
+    fn push_event(&mut self, mut ev: FeedEvent) {
+        ev.seq = self.seq_counter;
+        self.seq_counter += 1;
         self.feed.push_back(ev);
         while self.feed.len() > FEED_CAP {
             self.feed.pop_front();
@@ -255,21 +283,28 @@ impl App {
         self.cache_view = cv;
     }
 
-    /// The feed follows its tail only in natural (unsorted) order while live.
-    fn events_follow(&self) -> bool {
-        self.events_sort.col.is_none() && !self.paused
+    /// `true` when the feed is in its default "latest first" view: sorted by
+    /// Time (col 0) descending, so the newest event is at the top.
+    fn is_latest_view(&self) -> bool {
+        self.events_sort.col == Some(0) && self.events_sort.dir == SortDir::Desc
     }
 
-    /// Keep the feed pinned to its tail while following, and clamp both
+    /// The feed auto-pins to the newest row only in the default latest view
+    /// while live. In that view the newest row is row 0 (the top).
+    fn events_follow(&self) -> bool {
+        self.is_latest_view() && !self.paused
+    }
+
+    /// Keep the feed pinned to the newest row while following, and clamp both
     /// selections to their current (filtered) row counts.
     fn sync_selection(&mut self) {
         let n = self.events_view.len();
         if n == 0 {
             self.feed_state.select(None);
         } else if self.events_follow() {
-            self.feed_state.select(Some(n - 1));
+            self.feed_state.select(Some(0));
         } else {
-            let i = self.feed_state.selected().unwrap_or(n - 1).min(n - 1);
+            let i = self.feed_state.selected().unwrap_or(0).min(n - 1);
             self.feed_state.select(Some(i));
         }
 
@@ -292,7 +327,7 @@ impl App {
                 if n == 0 {
                     return;
                 }
-                let cur = self.feed_state.selected().unwrap_or(n - 1) as isize;
+                let cur = self.feed_state.selected().unwrap_or(0) as isize;
                 let next = (cur + delta).clamp(0, n as isize - 1) as usize;
                 self.feed_state.select(Some(next));
             }
@@ -310,9 +345,13 @@ impl App {
 
     fn scroll_to_top(&mut self) {
         match self.active {
+            // In the latest view, the top row is the newest event — going there
+            // is the live position, so resume following.
             Tab::Events => {
-                self.paused = true;
                 self.feed_state.select(Some(0));
+                if self.is_latest_view() {
+                    self.paused = false;
+                }
             }
             Tab::Cache => self.cache_state.select(Some(0)),
         }
@@ -320,13 +359,30 @@ impl App {
 
     fn scroll_to_bottom(&mut self) {
         match self.active {
-            // Resume tail-following; sync_selection pins to the last row.
-            Tab::Events => self.paused = false,
+            // The bottom row is the oldest event; pause so the view holds still.
+            Tab::Events => {
+                self.paused = true;
+                if !self.events_view.is_empty() {
+                    self.feed_state.select(Some(self.events_view.len() - 1));
+                }
+            }
             Tab::Cache if !self.cache_view.is_empty() => {
                 self.cache_state.select(Some(self.cache_view.len() - 1))
             }
             Tab::Cache => {}
         }
+    }
+
+    /// Reset the feed to its default "latest first" view: sort by Time
+    /// descending, resume the live feed, and jump to the newest row.
+    fn reset_latest(&mut self) {
+        self.active = Tab::Events;
+        self.events_sort = SortState {
+            col: Some(0),
+            dir: SortDir::Desc,
+        };
+        self.paused = false;
+        self.feed_state.select(Some(0));
     }
 
     /// Cycle the active panel's sort column: none → col 0 → … → last → none.
@@ -402,6 +458,7 @@ impl App {
             KeyCode::Char('v') => self.ip_filter = self.ip_filter.next(),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.toggle_sort_dir(),
+            KeyCode::Char('l') => self.reset_latest(),
             KeyCode::Char(' ') | KeyCode::Char('p') => self.paused = !self.paused,
             KeyCode::Char('r') => refresh.store(true, Ordering::SeqCst),
             KeyCode::Up => self.scroll(-1),
@@ -458,7 +515,7 @@ impl App {
             format!("  filter:\"{}\"", self.filter)
         };
         let mut s = format!(
-            " [?]help [/]filter [c]clear [v]ip [s/S]sort [Tab]panel [Space]pause [r]refresh [q]quit    {}  ip:{}  sort:{}  cache:{}  drop:{}{}",
+            " [?]help [/]filter [c]clear [v]ip [s/S]sort [l]latest [Tab]panel [Space]pause [r]refresh [q]quit    {}  ip:{}  sort:{}  cache:{}  drop:{}{}",
             if self.paused { "PAUSED" } else { "LIVE" },
             self.ip_filter.label(),
             self.sort_label(),
@@ -682,13 +739,14 @@ fn draw(f: &mut Frame, app: &mut App, cache: &[ReverseEntry]) {
 }
 
 /// Keyboard shortcuts shown in the help overlay.
-const HELP_LINES: [&str; 14] = [
+const HELP_LINES: [&str; 15] = [
     "",
     "  ?, h        Toggle this help",
     "  /           Filter by name / address (Enter apply · Esc clear)",
     "  c           Clear the active filter",
     "  v           Cycle IP family: all → v4 → v6",
     "  s / S        Cycle sort column / toggle direction",
+    "  l            Latest: events newest-first (Time ↓)",
     "  Tab          Switch panel (Events / Cache)",
     "  Space, p     Pause / resume the live feed",
     "  r            Refresh the reverse cache now",
@@ -749,6 +807,7 @@ fn draw_events(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.events_view.iter().map(|&i| {
         let e = &app.feed[i];
         Row::new([
+            e.time.clone(),
             e.name.clone(),
             e.record_type.to_string(),
             e.addr.clone(),
@@ -757,6 +816,7 @@ fn draw_events(f: &mut Frame, app: &mut App, area: Rect) {
         ])
     });
     let widths = [
+        Constraint::Length(10),
         Constraint::Min(20),
         Constraint::Length(6),
         Constraint::Length(39),
@@ -776,16 +836,20 @@ fn draw_cache(f: &mut Frame, app: &mut App, cache: &[ReverseEntry], area: Rect) 
     let rows = app.cache_view.iter().map(|&i| {
         let e = &cache[i];
         Row::new([
+            e.inserted.clone(),
             e.addr.clone(),
             e.name.clone(),
             format!("{}s", e.ttl),
             format!("{}s", e.age_secs),
+            format!("{}s", remaining_secs(e)),
         ])
     });
     let widths = [
+        Constraint::Length(10),
         Constraint::Length(39),
         Constraint::Min(20),
         Constraint::Length(8),
+        Constraint::Length(10),
         Constraint::Length(10),
     ];
     let table = Table::new(rows, widths)
@@ -840,6 +904,8 @@ mod tui_tests {
     /// Push a feed event with the given name/address (other fields filled in).
     fn push(app: &mut App, name: &str, addr: &str) {
         app.push_event(FeedEvent {
+            time:        "00:00:00".to_string(),
+            seq:         0, // overwritten by push_event
             name:        name.to_string(),
             record_type: "A",
             addr:        addr.to_string(),
@@ -850,7 +916,7 @@ mod tui_tests {
     }
 
     #[test]
-    fn feed_respects_cap_and_follows_tail() {
+    fn feed_respects_cap_and_follows_newest() {
         let mut app = App::new();
         for i in 0..(FEED_CAP + 50) {
             push(&mut app, &format!("h{i}.example.com"), "1.2.3.4");
@@ -858,10 +924,11 @@ mod tui_tests {
         assert_eq!(app.feed.len(), FEED_CAP, "feed capped at FEED_CAP");
         app.rebuild_views(&[]);
         app.sync_selection();
+        // Default latest-first view: the live feed pins to the newest row (top).
         assert_eq!(
             app.feed_state.selected(),
-            Some(FEED_CAP - 1),
-            "live feed follows the tail"
+            Some(0),
+            "live feed follows the newest event at the top"
         );
     }
 
@@ -873,13 +940,16 @@ mod tui_tests {
         }
         app.rebuild_views(&[]);
         app.sync_selection();
-        app.scroll(-3);
-        assert!(app.paused, "scrolling the feed pauses tail-follow");
-        assert_eq!(app.feed_state.selected(), Some(6));
-        // Once paused, sync_selection must not snap back to the tail.
+        // Latest-first view starts pinned to the top (newest); scroll down into
+        // older rows.
+        assert_eq!(app.feed_state.selected(), Some(0));
+        app.scroll(3);
+        assert!(app.paused, "scrolling the feed pauses follow");
+        assert_eq!(app.feed_state.selected(), Some(3));
+        // Once paused, sync_selection must not snap back to the newest row.
         app.rebuild_views(&[]);
         app.sync_selection();
-        assert_eq!(app.feed_state.selected(), Some(6));
+        assert_eq!(app.feed_state.selected(), Some(3));
     }
 
     #[test]
@@ -889,19 +959,21 @@ mod tui_tests {
         push(&mut app, "cdn.test.net", "2.2.2.2");
         push(&mut app, "mail.example.com", "3.3.3.3");
 
+        // Default view is Time-descending, so matching rows come back newest
+        // (highest index) first.
         app.filter = "EXAMPLE".to_string(); // case-insensitive
         app.rebuild_views(&[]);
-        assert_eq!(app.events_view, vec![0, 2], "only example.com rows match");
+        assert_eq!(app.events_view, vec![2, 0], "only example.com rows match");
 
         // A filter against the address field also matches.
         app.filter = "2.2.2.2".to_string();
         app.rebuild_views(&[]);
         assert_eq!(app.events_view, vec![1]);
 
-        // Empty filter shows everything again.
+        // Empty filter shows everything again (newest first).
         app.filter.clear();
         app.rebuild_views(&[]);
-        assert_eq!(app.events_view, vec![0, 1, 2]);
+        assert_eq!(app.events_view, vec![2, 1, 0]);
     }
 
     #[test]
@@ -911,14 +983,14 @@ mod tui_tests {
         push(&mut app, "v6.example.com", "2606:2800:220:1:248:1893:25c8:1946");
         push(&mut app, "also4.example.com", "1.2.3.4");
 
-        // Both families by default.
+        // Both families by default (newest first).
         app.rebuild_views(&[]);
-        assert_eq!(app.events_view, vec![0, 1, 2]);
+        assert_eq!(app.events_view, vec![2, 1, 0]);
 
         // v4 only.
         app.ip_filter = IpFilter::V4;
         app.rebuild_views(&[]);
-        assert_eq!(app.events_view, vec![0, 2]);
+        assert_eq!(app.events_view, vec![2, 0]);
 
         // v6 only.
         app.ip_filter = IpFilter::V6;
@@ -938,17 +1010,53 @@ mod tui_tests {
         push(&mut app, "aaa", "2.2.2.2");
         push(&mut app, "bbb", "3.3.3.3");
 
-        // Sort by Name (column 0) ascending.
-        app.cycle_sort();
-        assert_eq!(app.events_sort.col, Some(0));
+        // Sort by Name (column 1) ascending.
+        app.events_sort = SortState {
+            col: Some(1),
+            dir: SortDir::Asc,
+        };
         app.rebuild_views(&[]);
         assert_eq!(app.events_view, vec![1, 2, 0], "aaa, bbb, ccc");
-        assert!(!app.events_follow(), "an active sort disables tail-follow");
+        assert!(
+            !app.events_follow(),
+            "a non-default sort disables follow"
+        );
 
         // Toggle to descending.
         app.toggle_sort_dir();
         app.rebuild_views(&[]);
         assert_eq!(app.events_view, vec![0, 2, 1], "ccc, bbb, aaa");
+    }
+
+    #[test]
+    fn default_view_is_latest_first_and_l_resets() {
+        let mut app = App::new();
+        // The feed defaults to the latest-first view (Time ↓).
+        assert!(app.is_latest_view());
+        assert_eq!(app.events_sort.col, Some(0));
+        assert_eq!(app.events_sort.dir, SortDir::Desc);
+
+        push(&mut app, "first", "1.1.1.1");
+        push(&mut app, "second", "2.2.2.2");
+        push(&mut app, "third", "3.3.3.3");
+        app.rebuild_views(&[]);
+        assert_eq!(app.events_view, vec![2, 1, 0], "newest event on top");
+
+        // Move away: another panel, a different sort, paused. `l` restores the
+        // latest-first events view.
+        app.active = Tab::Cache;
+        app.events_sort = SortState {
+            col: Some(1),
+            dir: SortDir::Asc,
+        };
+        app.paused = true;
+
+        app.reset_latest();
+        assert_eq!(app.active, Tab::Events);
+        assert!(app.is_latest_view());
+        assert!(!app.paused, "l resumes the live feed");
+        app.rebuild_views(&[]);
+        assert_eq!(app.events_view, vec![2, 1, 0]);
     }
 
     #[test]

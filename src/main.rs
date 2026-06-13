@@ -109,12 +109,30 @@ pub(crate) fn monotonic_now_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// Local wall-clock time `secs_ago` seconds in the past, formatted `HH:MM:SS`.
+pub(crate) fn local_hms_ago(secs_ago: u64) -> String {
+    let mut now: libc::time_t = 0;
+    unsafe { libc::time(&mut now) };
+    let t = now - secs_ago as libc::time_t;
+    let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// Current local wall-clock time formatted as `HH:MM:SS`.
+pub(crate) fn local_hms() -> String {
+    local_hms_ago(0)
+}
+
 /// One live entry of the reverse cache, decoded for display.
 pub(crate) struct ReverseEntry {
     pub(crate) addr:     String,
     pub(crate) name:     String,
     pub(crate) ttl:      u32,
     pub(crate) age_secs: u64,
+    /// Local wall-clock time the entry was (last) inserted, formatted `HH:MM:SS`,
+    /// derived from `age_secs` at snapshot time.
+    pub(crate) inserted: String,
 }
 
 /// Iterate the in-kernel reverse cache (address -> name) and return the live
@@ -145,11 +163,13 @@ pub(crate) fn live_reverse_entries(skel: &DnsParserSkel) -> Vec<ReverseEntry> {
         };
         let name_len = (v.name_len as usize).min(DNS_MAX_NAME_LEN);
         let name = String::from_utf8_lossy(&v.name[..name_len]).into_owned();
+        let age_secs = age / 1_000_000_000;
         out.push(ReverseEntry {
             addr,
             name,
             ttl: v.ttl,
-            age_secs: age / 1_000_000_000,
+            age_secs,
+            inserted: local_hms_ago(age_secs),
         });
     }
     out
