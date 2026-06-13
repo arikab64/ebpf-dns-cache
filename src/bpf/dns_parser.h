@@ -40,9 +40,10 @@ typedef unsigned int    u32;
 #define DNS_PTR_OFFSET      0x3FFF  // low 14 bits of a pointer = target
 
 // jump table (BPF_MAP_TYPE_PROG_ARRAY) indices
-#define PROG_PARSE_FQDN     0    // assemble one name 
+#define PROG_PARSE_FQDN     0    // assemble one name
 #define PROG_WALK_QUESTION  1    // skip question names (seed cache), then answers
-#define PROG_WALK_ANSWER    2    // walk answer records, emit A/AAAA IPs
+#define PROG_WALK_ANSWER    2    // walk answer records, buffer A/AAAA events
+#define PROG_EMIT_EVENTS    3    // drain buffered events into the ring buffer
 
 
 typedef struct cache_entry {
@@ -111,11 +112,20 @@ typedef struct dns_event {
     u16 answer_idx;               // 0-based index of this answer in the response
     u8  is_ipv6;                  // 0 = ip4 valid, 1 = ip6 valid
     u8  _pad[3];
-    u32 ip4;                      // network byte order, valid if !is_ipv6 
-    u8  ip6[16];                  // valid if is_ipv6 
+    u32 ip4;                      // network byte order, valid if !is_ipv6
+    u8  ip6[16];                  // valid if is_ipv6
     u32 ttl;                      // record TTL in seconds
     char  name[DNS_MAX_NAME_LEN + 1];  /* answer owner FQDN */
 } dns_event_t;
+
+// Per-CPU staging buffer: walk_answer appends each A/AAAA event here, then the
+// emit program drains events[0 .. n) into the events ring buffer in one pass.
+#define DNS_MAX_PENDING_EVENTS  16   // max answers buffered per packet
+
+typedef struct dns_event_batch {
+    u32 n;                                       // number of buffered events
+    dns_event_t events[DNS_MAX_PENDING_EVENTS];
+} dns_event_batch_t;
 
 
 typedef enum dns_parser_error_e {

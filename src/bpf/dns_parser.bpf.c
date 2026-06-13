@@ -36,10 +36,17 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 3);    // PROG_PARSE_FQDN, PROG_WALK_QUESTION, PROG_WALK_ANSWER
+    __uint(max_entries, 4);    // PROG_PARSE_FQDN, PROG_WALK_QUESTION, PROG_WALK_ANSWER, PROG_EMIT_EVENTS
     __type(key, u32);
     __type(value, u32);
 } jmp_table SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, dns_event_batch_t);
+} event_batch SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -56,6 +63,12 @@ static __always_inline dns_parser_state_t *get_state(void)
 {
     u32 k = 0;
     return bpf_map_lookup_elem(&state_map, &k);
+}
+
+static __always_inline dns_event_batch_t *get_batch(void)
+{
+    u32 k = 0;
+    return bpf_map_lookup_elem(&event_batch, &k);
 }
 
 
@@ -222,6 +235,11 @@ int xdp_dns_ingress(struct xdp_md *ctx)
     st->q_remaining  = qdcount;
     st->a_remaining  = ancount;
     st->answer_idx   = 0;
+
+    // reset the per-CPU event staging buffer for this packet
+    dns_event_batch_t *batch = get_batch();
+    if (batch)
+        batch->n = 0;
 
     bpf_printk0("[dns-parser-%d/%d] flags=0x%04x qd=%d an=%d\n",
                st->id, st->cpu, bpf_ntohs(dns->flags), st->qcount, st->acount);
@@ -443,6 +461,7 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
     if (st->a_remaining == 0)
     {
         bpf_printk0("[dns-parser-%d/%d] walk_answer: all answers processed\n", st->id, st->cpu);
+        bpf_tail_call(ctx, &jmp_table, PROG_EMIT_EVENTS);
         return XDP_PASS;
     }
 
@@ -493,9 +512,14 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
     if ((type == DNS_TYPE_A && rdlen == 4) ||
         (type == DNS_TYPE_AAAA && rdlen == 16))
     {
-        dns_event_t *ev = bpf_ringbuf_reserve(&events, sizeof(dns_event_t), 0);
-        if (ev)
+        // Append the event to the per-CPU staging buffer instead of submitting
+        // it inline; PROG_EMIT_EVENTS drains the buffer once all answers are
+        // walked. Drop the event if the buffer is already full.
+        dns_event_batch_t *batch = get_batch();
+        u32 idx = batch ? batch->n : DNS_MAX_PENDING_EVENTS;
+        if (batch && idx < DNS_MAX_PENDING_EVENTS)
         {
+            dns_event_t *ev = &batch->events[idx];
             ev->qtype      = type;
             ev->name_len   = nl;
             ev->txid       = st->id;
@@ -507,10 +531,7 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
             if (type == DNS_TYPE_A)
             {
                 if (data + rdata + 4 > data_end)
-                {
-                    bpf_ringbuf_discard(ev, 0);
                     return XDP_PASS;
-                }
                 ev->is_ipv6 = 0;
                 ev->ip4 = *(u32 *)(data + rdata);
                 __builtin_memset(ev->ip6, 0, sizeof(ev->ip6));
@@ -518,10 +539,7 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
             else
             {
                 if (data + rdata + 16 > data_end)
-                {
-                    bpf_ringbuf_discard(ev, 0);
                     return XDP_PASS;
-                }
                 ev->is_ipv6 = 1;
                 ev->ip4 = 0;
                 #pragma unroll
@@ -543,6 +561,8 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
             if (nl <= DNS_MAX_NAME_LEN)
                 ev->name[nl] = '\0';
 
+            batch->n = idx + 1;
+
             bpf_printk0("[dns-parser-%d/%d] walk_answer %d: name=%s, ttl=%d\n",
                        st->id, st->cpu, ev->answer_idx, ev->name, ev->ttl);
 
@@ -556,8 +576,6 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
                 bpf_printk0("[dns-parser-%d/%d] walk_answer %d: IPv4=%pI4",
                            st->id, st->cpu, ev->answer_idx, &ev->ip4);
             }
-
-            bpf_ringbuf_submit(ev, 0);
         }
     }
     
@@ -568,6 +586,35 @@ int xdp_dns_walk_answer(struct xdp_md *ctx)
 
     // next record
     bpf_tail_call(ctx, &jmp_table, PROG_WALK_ANSWER);
+    return XDP_PASS;
+}
+
+SEC("xdp")
+int xdp_dns_emit_events(struct xdp_md *ctx)
+{
+    dns_event_batch_t *batch = get_batch();
+    if (!batch)
+        return XDP_PASS;
+
+    u32 n = batch->n;
+    if (n > DNS_MAX_PENDING_EVENTS)
+        n = DNS_MAX_PENDING_EVENTS;
+
+    bpf_printk0("[dns-parser] emit_events: draining %d event(s)\n", n);
+
+    for (u32 i = 0; i < DNS_MAX_PENDING_EVENTS; i++)
+    {
+        if (i >= n)
+            break;
+
+        dns_event_t *ev = bpf_ringbuf_reserve(&events, sizeof(dns_event_t), 0);
+        if (!ev)
+            break;
+        __builtin_memcpy(ev, &batch->events[i], sizeof(dns_event_t));
+        bpf_ringbuf_submit(ev, 0);
+    }
+
+    batch->n = 0;
     return XDP_PASS;
 }
 

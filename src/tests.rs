@@ -25,6 +25,7 @@ use crate::dns_parser::*;
 const PROG_PARSE_FQDN: u32 = 0;
 const PROG_WALK_QUESTION: u32 = 1;
 const PROG_WALK_ANSWER: u32 = 2;
+const PROG_EMIT_EVENTS: u32 = 3;
 
 // XDP action codes (uapi/linux/bpf.h)
 const XDP_PASS: u32 = 2;
@@ -212,6 +213,7 @@ impl Harness {
             (PROG_PARSE_FQDN, skel.progs.xdp_dns_parse_fqdn.as_fd()),
             (PROG_WALK_QUESTION, skel.progs.xdp_dns_walk_question.as_fd()),
             (PROG_WALK_ANSWER, skel.progs.xdp_dns_walk_answer.as_fd()),
+            (PROG_EMIT_EVENTS, skel.progs.xdp_dns_emit_events.as_fd()),
         ];
         for (idx, prog_fd) in tail_calls {
             let key = idx.to_ne_bytes();
