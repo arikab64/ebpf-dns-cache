@@ -157,9 +157,9 @@ make test-one TEST=parses_multi_label_fqdn
 ## Usage
 
 ```bash
-sudo ./target/debug/ebpf-dns-cache [-v] [--payload] [--dump-cache | --tui] <interface>
+sudo ./target/debug/loader [-v] [--payload] [--dump-cache | --tui] <interface>
 # e.g.
-sudo ./target/debug/ebpf-dns-cache eth0
+sudo ./target/debug/loader eth0
 ```
 
 - `-v` enables verbose BPF debug logging.
@@ -183,7 +183,7 @@ Structured logs go to `dns-cache_YYYY-MM-DD_HH-MM-SS.log`. Raw DNS payloads (for
 While an instance is attached and observing traffic, it populates the pinned `dns_reverse` map (see [Reverse cache](#reverse-cache-address--name)). A second invocation with `--dump-cache` reopens that same pinned map, prints every live (non-expired) `address → name` entry, and exits without attaching:
 
 ```bash
-sudo ./target/debug/ebpf-dns-cache --dump-cache
+sudo ./target/debug/loader --dump-cache
 ```
 
 ```
@@ -200,7 +200,7 @@ Entries whose age exceeds their TTL are skipped (treated as a miss), so the dump
 `--tui` attaches like a normal run but, instead of streaming log lines, presents a [ratatui](https://ratatui.rs)-based terminal UI with two tabbed panels:
 
 ```bash
-sudo ./target/release/ebpf-dns-cache --tui eth0
+sudo ./target/release/loader --tui eth0
 ```
 
 - **Events** — a live feed of parsed DNS answers (local arrival time `HH:MM:SS`, name, record type, address, TTL, transaction id / answer index) as they arrive on the `events` ring buffer. By default the feed is sorted newest-first (most recent at the top) and follows new arrivals; press `l` at any time to jump back to this latest-first view.

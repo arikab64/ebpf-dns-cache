@@ -622,6 +622,11 @@ fn worker_loop(
         return Err(anyhow::Error::new(e).context("bpf_xdp_attach"));
     }
 
+    // Log the attach so the file-only TUI log exists from startup, even before
+    // the first DNS event arrives (flexi_logger creates the file lazily on the
+    // first write).
+    log::info!("attached xdp_dns_ingress (ifindex={ifindex}) in TUI mode");
+
     // Seed the cache panel before the first refresh tick so it isn't blank.
     *shared.cache.lock().unwrap() = live_reverse_entries(&skel);
 
@@ -640,6 +645,18 @@ fn worker_loop(
         rb_builder
             .add(&skel.maps.events, move |data: &[u8]| -> i32 {
                 if let Some(ev) = read_dns_event(data) {
+                    // The screen shows the live feed; mirror each event into the
+                    // file log too (TUI logging is file-only) so a run leaves a
+                    // record, matching headless `print_dns_event`.
+                    log::info!(
+                        "[txid={} answer={}] {} {} {} ttl={}",
+                        ev.txid,
+                        ev.answer_idx,
+                        ev.name(),
+                        ev.record_type(),
+                        ev.addr(),
+                        ev.ttl
+                    );
                     if feed_tx.try_send(FeedEvent::from(&ev)).is_err() {
                         shared.dropped.fetch_add(1, Ordering::Relaxed);
                     }

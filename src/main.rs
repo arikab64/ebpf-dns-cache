@@ -344,7 +344,10 @@ fn main() -> Result<()> {
         println!("dns-cache: a simple XDP-based DNS cache for testing and fuzzing");
         logger = logger.duplicate_to_stderr(Duplicate::All);
     }
-    logger.start()?;
+    // Keep the handle alive for the whole program: dropping it shuts down the
+    // file writer (flexi_logger's WritersHandle::drop), so a discarded handle
+    // would close the log file before any runtime lines are written.
+    let _logger_handle = logger.start()?;
 
     let mut open_obj = std::mem::MaybeUninit::uninit();
     let builder = DnsParserSkelBuilder::default();
