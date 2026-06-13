@@ -10,11 +10,14 @@
 //!     cargo test --no-run
 //!     sudo target/debug/deps/loader-<hash> --test-threads=1
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::mem::{align_of, size_of};
 use std::os::fd::{AsFd, AsRawFd};
+use std::rc::Rc;
 
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
-use libbpf_rs::{MapCore, MapFlags};
+use libbpf_rs::{MapCore, MapFlags, RingBuffer, RingBufferBuilder};
 
 use crate::dns_parser::*;
 
@@ -87,23 +90,97 @@ struct DnsParserState {
     stack:         [Frame; DNS_MAX_DEPTH],
 }
 
-// captured from live traffic (txid=0xACCF): e40052.dscx.akamaiedge.net, 2x A records
-// wire format: 1 question + 2 answers, compression pointers in answer owner names
-const DNS_RESPONSE: [u8; 215] = [
-    0x29, 0x76, 0x81, 0x80, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x12, 0x63, 0x6f, 0x6e,
-    0x6e, 0x65, 0x63, 0x74, 0x69, 0x76, 0x69, 0x74, 0x79, 0x2d, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x06,
-    0x75, 0x62, 0x75, 0x6e, 0x74, 0x75, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x1c, 0x00, 0x01, 0xc0,
-    0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x21, 0x00, 0x10, 0x26, 0x20, 0x00, 0x2d, 0x40,
-    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x01, 0xc0, 0x0c, 0x00, 0x1c, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x21, 0x00, 0x10, 0x26, 0x20, 0x00, 0x2d, 0x40, 0x00, 0x00, 0x01, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00,
-    0x21, 0x00, 0x10, 0x26, 0x20, 0x00, 0x2d, 0x40, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x01, 0x97, 0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x21, 0x00, 0x10, 0x26,
-    0x20, 0x00, 0x2d, 0x40, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x96, 0xc0,
-    0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x21, 0x00, 0x10, 0x26, 0x20, 0x00, 0x2d, 0x40,
-    0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x98, 0xc0, 0x0c, 0x00, 0x1c, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x21, 0x00, 0x10, 0x26, 0x20, 0x00, 0x2d, 0x40, 0x00, 0x00, 0x01, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x99,
+// Mirror of `dns_event_t` from src/bpf/dns_parser.h. One record (A or AAAA)
+// the parser emitted into the `events` ring buffer.
+const DNS_MAX_NAME_LEN: usize = 255;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnsEvent {
+    qtype:      u16,
+    name_len:   u16,
+    txid:       u16,
+    answer_idx: u16,
+    is_ipv6:    u8,
+    _pad:       [u8; 3],
+    ip4:        u32,
+    ip6:        [u8; 16],
+    ttl:        u32,
+    name:       [u8; DNS_MAX_NAME_LEN + 1],
+}
+
+impl DnsEvent {
+    /// The owner FQDN, trimmed to the recorded `name_len`.
+    fn name(&self) -> String {
+        let n = (self.name_len as usize).min(DNS_MAX_NAME_LEN);
+        String::from_utf8_lossy(&self.name[..n]).into_owned()
+    }
+}
+
+/// Drains the `events` ring buffer one `DnsEvent` at a time.
+///
+/// libbpf's ring buffer only exposes a callback-driven `consume`, so we attach
+/// a callback that pushes every record into a queue, then hand them back one by
+/// one via [`EventReader::next_event`]. The reader lazily consumes the kernel
+/// buffer when the queue runs dry, so `next_event` returns `None` once the ring
+/// buffer holds nothing more.
+struct EventReader<'a> {
+    rb:    RingBuffer<'a>,
+    queue: Rc<RefCell<VecDeque<DnsEvent>>>,
+}
+
+impl<'a> EventReader<'a> {
+    fn new(skel: &'a DnsParserSkel<'a>) -> Self {
+        let queue: Rc<RefCell<VecDeque<DnsEvent>>> = Rc::new(RefCell::new(VecDeque::new()));
+        let sink = queue.clone();
+
+        let mut builder = RingBufferBuilder::new();
+        builder
+            .add(&skel.maps.events, move |data: &[u8]| -> i32 {
+                if data.len() >= size_of::<DnsEvent>() {
+                    // SAFETY: `data` is at least as large as the struct, which
+                    // mirrors the kernel-side C layout. Unaligned read since the
+                    // ring buffer hands us an arbitrarily-aligned slice.
+                    let ev: DnsEvent =
+                        unsafe { std::ptr::read_unaligned(data.as_ptr() as *const DnsEvent) };
+                    sink.borrow_mut().push_back(ev);
+                }
+                0
+            })
+            .expect("ringbuf add events");
+        let rb = builder.build().expect("ringbuf build");
+
+        Self { rb, queue }
+    }
+
+    /// Return the next `DnsEvent` from the ring buffer, or `None` if it is
+    /// empty. Newly available records are consumed on demand.
+    fn next_event(&self) -> Option<DnsEvent> {
+        if self.queue.borrow().is_empty() {
+            self.rb.consume().expect("consume events ring buffer");
+        }
+        self.queue.borrow_mut().pop_front()
+    }
+}
+
+// captured from live traffic (txid=0x1925): query for config.extension.grammarly.com,
+// answered by a CNAME to d27xxe7juh1us6.cloudfront.net plus four A records (and an OPT
+// record in the additional section). Answer owner names use compression pointers.
+const DNS_RESPONSE: [u8; 166] = [
+   0x19, 0x25, 0x81, 0x80, 0x00, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01,
+            0x06, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x09, 0x65, 0x78, 0x74, 0x65,
+            0x6e, 0x73, 0x69, 0x6f, 0x6e, 0x09, 0x67, 0x72, 0x61, 0x6d, 0x6d, 0x61,
+            0x72, 0x6c, 0x79, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01,
+            0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x7a, 0x00, 0x1f,
+            0x0e, 0x64, 0x32, 0x37, 0x78, 0x78, 0x65, 0x37, 0x6a, 0x75, 0x68, 0x31,
+            0x75, 0x73, 0x36, 0x0a, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x66, 0x72, 0x6f,
+            0x6e, 0x74, 0x03, 0x6e, 0x65, 0x74, 0x00, 0xc0, 0x3c, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x04, 0x0d, 0xe0, 0xf5, 0x6c, 0xc0,
+            0x3c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x04, 0x0d,
+            0xe0, 0xf5, 0x7b, 0xc0, 0x3c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x1c, 0x00, 0x04, 0x0d, 0xe0, 0xf5, 0x3d, 0xc0, 0x3c, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x04, 0x0d, 0xe0, 0xf5, 0x4e, 0x00,
+            0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 ];
 
 /// A loaded skeleton plus the bookkeeping needed to drive test runs.
@@ -524,19 +601,43 @@ fn parses_dns_response() {
     let mut harness = Harness::new();
     let skel = harness.load();
 
+    // The events ring buffer must be attached before the program runs so the
+    // record submitted during `test_run` is waiting for us to consume.
+    let reader = EventReader::new(&skel);
+
     let packet = build_dns_response(&DNS_RESPONSE);
-    let _action = run_ingress(&skel, &packet);
-    println!("state after DNS response");
-    /*
+    let action = run_ingress(&skel, &packet);
     assert_eq!(action, XDP_PASS, "ingress should pass the packet");
 
-    let st = read_state(&skel);
-    assert_eq!(st.id, 0xBEEF, "transaction id");
-    assert_eq!(st.q_remaining, 1, "qdcount");
-    assert_eq!(st.a_remaining, 0, "ancount");
-    // `name_complete` resets `return_flag` to 0 for the next name; the recorded
-    // length is the durable proof the root label terminated the parse.
-    assert_eq!(st.cur_name_len, 11, "recorded assembled name length");
-    assert_eq!(fqdn(&st), "example.com");
-    */
+    // The CNAME answer (record 0) is skipped; the four A records that follow
+    // are all owned by the CNAME target d27xxe7juh1us6.cloudfront.net.
+    let expected_ips = [
+        [13, 224, 245, 108],
+        [13, 224, 245, 123],
+        [13, 224, 245, 61],
+        [13, 224, 245, 78],
+    ];
+
+    for (i, ip) in expected_ips.iter().enumerate() {
+        let ev = reader
+            .next_event()
+            .unwrap_or_else(|| panic!("expected A answer {} in the ring buffer", i + 1));
+        assert_eq!(ev.txid, 0x1925, "transaction id");
+        assert_eq!(ev.qtype, 1, "A record type");
+        // answer_idx counts every record, so the four A records are 1..=4
+        // (the leading CNAME is record 0).
+        assert_eq!(ev.answer_idx as usize, i + 1, "answer index");
+        assert_eq!(ev.is_ipv6, 0, "A => IPv4 address valid");
+        assert_eq!(ev.name(), "d27xxe7juh1us6.cloudfront.net");
+        assert_eq!(ev.name_len as usize, "d27xxe7juh1us6.cloudfront.net".len());
+        assert_eq!(ev.ttl, 28, "answer TTL");
+        // ip4 holds the wire bytes in network order; to_ne_bytes recovers them.
+        assert_eq!(ev.ip4.to_ne_bytes(), *ip, "A record address");
+    }
+
+    // The ring buffer held exactly the four A answers; the next read drains nothing.
+    assert!(
+        reader.next_event().is_none(),
+        "ring buffer should be empty after the four A answers"
+    );
 }
