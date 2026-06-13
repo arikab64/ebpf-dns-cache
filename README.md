@@ -141,7 +141,7 @@ make vmlinux
 # Compile the BPF C code and generate the Rust skeleton
 make skel
 
-# Build the Rust loader (debug)
+# Build the Rust binary (debug)
 make build
 
 # Build optimized
@@ -157,9 +157,9 @@ make test-one TEST=parses_multi_label_fqdn
 ## Usage
 
 ```bash
-sudo ./target/debug/loader [-v] [--payload] [--dump-cache | --tui] <interface>
+sudo ./target/debug/ebpf-dns-cache [-v] [--payload] [--dump-cache | --tui] <interface>
 # e.g.
-sudo ./target/debug/loader eth0
+sudo ./target/debug/ebpf-dns-cache eth0
 ```
 
 - `-v` enables verbose BPF debug logging.
@@ -170,10 +170,10 @@ sudo ./target/debug/loader eth0
 Example output:
 
 ```
-INFO [loader] attached xdp_dns_ingress to eth0 (ifindex=2). Ctrl-C to detach.
-INFO [loader] [txid=9174 answer=0] api.example.com A 93.184.216.34
-INFO [loader] [txid=9174 answer=1] api.example.com A 93.184.216.35
-INFO [loader] [txid=2976 answer=0] connectivity-check.ubuntu.com AAAA 2620:2d:4000:1::17
+INFO [ebpf_dns_cache] attached xdp_dns_ingress to eth0 (ifindex=2). Ctrl-C to detach.
+INFO [ebpf_dns_cache] [txid=9174 answer=0] api.example.com A 93.184.216.34
+INFO [ebpf_dns_cache] [txid=9174 answer=1] api.example.com A 93.184.216.35
+INFO [ebpf_dns_cache] [txid=2976 answer=0] connectivity-check.ubuntu.com AAAA 2620:2d:4000:1::17
 ```
 
 Structured logs go to `dns-cache_YYYY-MM-DD_HH-MM-SS.log`. Raw DNS payloads (for debugging or test generation) are written to `payloads.json` only when `--payload` is passed.
@@ -183,14 +183,14 @@ Structured logs go to `dns-cache_YYYY-MM-DD_HH-MM-SS.log`. Raw DNS payloads (for
 While an instance is attached and observing traffic, it populates the pinned `dns_reverse` map (see [Reverse cache](#reverse-cache-address--name)). A second invocation with `--dump-cache` reopens that same pinned map, prints every live (non-expired) `address → name` entry, and exits without attaching:
 
 ```bash
-sudo ./target/debug/loader --dump-cache
+sudo ./target/debug/ebpf-dns-cache --dump-cache
 ```
 
 ```
-INFO [loader] reverse DNS cache (address -> name):
-INFO [loader]   93.184.216.34 -> api.example.com (ttl=300s, age=12s)
-INFO [loader]   2620:2d:4000:1::17 -> connectivity-check.ubuntu.com (ttl=60s, age=4s)
-INFO [loader] 2 live entries
+INFO [ebpf_dns_cache] reverse DNS cache (address -> name):
+INFO [ebpf_dns_cache]   93.184.216.34 -> api.example.com (ttl=300s, age=12s)
+INFO [ebpf_dns_cache]   2620:2d:4000:1::17 -> connectivity-check.ubuntu.com (ttl=60s, age=4s)
+INFO [ebpf_dns_cache] 2 live entries
 ```
 
 Entries whose age exceeds their TTL are skipped (treated as a miss), so the dump reflects only currently-valid mappings.

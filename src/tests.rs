@@ -1,14 +1,14 @@
 //! Unit tests for the XDP DNS parser, driven through BPF_PROG_TEST_RUN.
 //!
 //! These tests load the real BPF object, populate the tail-call `jmp_table`
-//! exactly like the loader does, feed crafted packets into `xdp_dns_ingress`
+//! exactly like the main binary does, feed crafted packets into `xdp_dns_ingress`
 //! via `Program::test_run`, and assert on the resulting parser state.
 //!
 //! Loading and running BPF programs requires privileges (CAP_BPF /
 //! CAP_SYS_ADMIN), so this suite must be run as root, e.g.:
 //!
 //!     cargo test --no-run
-//!     sudo target/debug/deps/loader-<hash> --test-threads=1
+//!     sudo target/debug/deps/ebpf_dns_cache-<hash> --test-threads=1
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -246,7 +246,7 @@ impl Harness {
     }
 
     /// Open + load the skeleton and wire the tail-call jump table, mirroring
-    /// the loader in `main.rs`. Returns the loaded skeleton.
+    /// the main binary in `main.rs`. Returns the loaded skeleton.
     fn load(&mut self) -> DnsParserSkel<'_> {
         let builder = DnsParserSkelBuilder::default();
         let mut open_skel = builder.open(&mut self.obj).expect("open skeleton");

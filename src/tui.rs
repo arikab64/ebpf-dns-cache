@@ -1,4 +1,4 @@
-//! Interactive terminal UI for the DNS cache (`loader --tui <iface>`).
+//! Interactive terminal UI for the DNS cache (`ebpf-dns-cache --tui <iface>`).
 //!
 //! A single background "BPF worker" thread owns the loaded skeleton, attaches
 //! XDP, polls the `events` / `dns_capture_rb` ring buffers, and periodically
