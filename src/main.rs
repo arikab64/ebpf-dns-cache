@@ -213,6 +213,7 @@ pub(crate) struct Capture {
 /// the headless loop and the TUI worker.
 pub(crate) fn capture_callback(
     captures: Arc<Mutex<BTreeMap<String, Capture>>>,
+    write_payload: Arc<AtomicBool>,
 ) -> impl FnMut(&[u8]) -> i32 {
     move |data: &[u8]| -> i32 {
         // txid(2) + cpu(2) + qdcount(2) + ancount(2) + len(2) + payload
@@ -236,7 +237,9 @@ pub(crate) fn capture_callback(
                 payload,
             },
         );
-        write_payloads("payloads.json", &map);
+        if write_payload.load(Ordering::Relaxed) {
+            write_payloads("payloads.json", &map);
+        }
         debug!("captured {key} (q={qdcount} a={ancount} {pay_len} bytes)");
         0
     }
@@ -290,11 +293,15 @@ fn if_nametoindex(name: &str) -> Result<u32> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let usage = format!("usage: {} [-v] [--dump-cache | --tui] <iface>", args[0]);
+    let usage = format!(
+        "usage: {} [-v] [--payload] [--dump-cache | --tui] <iface>",
+        args[0]
+    );
     let mut ifname = None;
     let mut debug_enabled = false;
     let mut dump_only = false;
     let mut tui_enabled = false;
+    let mut payload_enabled = false;
 
     for arg in args.iter().skip(1) {
         if arg == "-v" {
@@ -303,6 +310,8 @@ fn main() -> Result<()> {
             dump_only = true;
         } else if arg == "--tui" {
             tui_enabled = true;
+        } else if arg == "--payload" {
+            payload_enabled = true;
         } else if ifname.is_none() {
             ifname = Some(arg);
         } else {
@@ -391,7 +400,7 @@ fn main() -> Result<()> {
     // XDP, polls the ring buffers, and snapshots the reverse cache on its own
     // worker thread.
     if tui_enabled {
-        return tui::run(skel, ifindex, stop);
+        return tui::run(skel, ifindex, stop, payload_enabled);
     }
 
     // attach xdp_dns_ingress
@@ -401,10 +410,14 @@ fn main() -> Result<()> {
         .with_context(|| format!("bpf_xdp_attach({ifname})"))?;
 
     let captures: Arc<Mutex<BTreeMap<String, Capture>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let payload_flag = Arc::new(AtomicBool::new(payload_enabled));
 
     let mut rb_builder = RingBufferBuilder::new();
     rb_builder
-        .add(&skel.maps.dns_capture_rb, capture_callback(captures.clone()))
+        .add(
+            &skel.maps.dns_capture_rb,
+            capture_callback(captures.clone(), payload_flag.clone()),
+        )
         .context("ringbuf add")?;
     rb_builder
         .add(&skel.maps.events, |data: &[u8]| -> i32 {
@@ -422,7 +435,9 @@ fn main() -> Result<()> {
 
     drop(rb);
     let _ = xdp.detach(ifindex, XdpFlags::UPDATE_IF_NOEXIST);
-    write_payloads("payloads.json", &captures.lock().unwrap());
+    if payload_enabled {
+        write_payloads("payloads.json", &captures.lock().unwrap());
+    }
     Ok(())
 }
 

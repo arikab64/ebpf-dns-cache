@@ -195,6 +195,9 @@ struct App {
     dropped:      u64,
     status:       Option<String>,
     paused:       bool,
+    /// Whether captured DNS payloads are being written to `payloads.json`.
+    /// Mirrors the shared flag the worker reads; toggled with `p`.
+    payload_on:   bool,
     /// Active substring filter (case-insensitive, name + address).
     filter:       String,
     /// `true` while the user is typing into the filter input.
@@ -223,6 +226,7 @@ impl App {
             dropped:     0,
             status:      None,
             paused:      false,
+            payload_on:  false,
             filter:      String::new(),
             filtering:   false,
             ip_filter:   IpFilter::Both,
@@ -414,7 +418,13 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent, stop: &AtomicBool, refresh: &AtomicBool) {
+    fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        stop: &AtomicBool,
+        refresh: &AtomicBool,
+        payload: &AtomicBool,
+    ) {
         // Ctrl-C always quits, even mid-typing.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             stop.store(true, Ordering::SeqCst);
@@ -459,7 +469,13 @@ impl App {
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.toggle_sort_dir(),
             KeyCode::Char('l') => self.reset_latest(),
-            KeyCode::Char(' ') | KeyCode::Char('p') => self.paused = !self.paused,
+            KeyCode::Char(' ') => self.paused = !self.paused,
+            KeyCode::Char('p') => {
+                // Toggle payload capture; the worker's callback reads this flag.
+                let on = !payload.load(Ordering::Relaxed);
+                payload.store(on, Ordering::Relaxed);
+                self.payload_on = on;
+            }
             KeyCode::Char('r') => refresh.store(true, Ordering::SeqCst),
             KeyCode::Up => self.scroll(-1),
             KeyCode::Down => self.scroll(1),
@@ -515,10 +531,11 @@ impl App {
             format!("  filter:\"{}\"", self.filter)
         };
         let mut s = format!(
-            " [?]help [/]filter [c]clear [v]ip [s/S]sort [l]latest [Tab]panel [Space]pause [r]refresh [q]quit    {}  ip:{}  sort:{}  cache:{}  drop:{}{}",
+            " [?]help [/]filter [c]clear [v]ip [s/S]sort [l]latest [Tab]panel [Space]pause [p]payload [r]refresh [q]quit    {}  ip:{}  sort:{}  payload:{}  cache:{}  drop:{}{}",
             if self.paused { "PAUSED" } else { "LIVE" },
             self.ip_filter.label(),
             self.sort_label(),
+            if self.payload_on { "on" } else { "off" },
             self.cache_view.len(),
             self.dropped,
             filt,
@@ -534,7 +551,12 @@ impl App {
 /// Run the interactive UI. Takes ownership of the loaded skeleton; attaches XDP,
 /// polls, and detaches on its worker thread. Returns once the user quits or the
 /// worker hits a fatal error.
-pub fn run(skel: DnsParserSkel<'_>, ifindex: i32, stop: Arc<AtomicBool>) -> Result<()> {
+pub fn run(
+    skel: DnsParserSkel<'_>,
+    ifindex: i32,
+    stop: Arc<AtomicBool>,
+    payload_enabled: bool,
+) -> Result<()> {
     let (feed_tx, feed_rx) = sync_channel::<FeedEvent>(FEED_CHAN_CAP);
     let shared = Shared {
         cache:   Mutex::new(Vec::new()),
@@ -542,6 +564,9 @@ pub fn run(skel: DnsParserSkel<'_>, ifindex: i32, stop: Arc<AtomicBool>) -> Resu
         status:  Mutex::new(None),
         refresh: AtomicBool::new(false),
     };
+    // Shared between the worker's capture callback (reader) and the UI's `p`
+    // toggle (writer); cloned into the worker, borrowed by the UI loop.
+    let payload = Arc::new(AtomicBool::new(payload_enabled));
 
     // ratatui::init installs a panic hook that restores the terminal, so a panic
     // on either thread won't leave the user's terminal in raw mode.
@@ -552,10 +577,13 @@ pub fn run(skel: DnsParserSkel<'_>, ifindex: i32, stop: Arc<AtomicBool>) -> Resu
     let stop_ref: &AtomicBool = &stop;
     let shared_ref: &Shared = &shared;
 
+    let payload_worker = payload.clone();
     let res = thread::scope(|s| -> Result<()> {
-        let worker = s.spawn(move || worker_loop(skel, ifindex, stop_ref, feed_tx, shared_ref));
+        let worker = s.spawn(move || {
+            worker_loop(skel, ifindex, stop_ref, feed_tx, shared_ref, payload_worker)
+        });
 
-        let ui_res = ui_loop(&mut terminal, &feed_rx, &shared, &stop);
+        let ui_res = ui_loop(&mut terminal, &feed_rx, &shared, &stop, &payload);
 
         // Make sure the worker leaves its poll loop and runs teardown (XDP
         // detach + payloads flush) before we restore the terminal.
@@ -585,6 +613,7 @@ fn worker_loop(
     stop: &AtomicBool,
     feed_tx: SyncSender<FeedEvent>,
     shared: &Shared,
+    payload: Arc<AtomicBool>,
 ) -> Result<()> {
     let xdp = libbpf_rs::Xdp::new(skel.progs.xdp_dns_ingress.as_fd());
     if let Err(e) = xdp.attach(ifindex, XdpFlags::UPDATE_IF_NOEXIST) {
@@ -603,7 +632,10 @@ fn worker_loop(
     let result = (|| -> Result<()> {
         let mut rb_builder = RingBufferBuilder::new();
         rb_builder
-            .add(&skel.maps.dns_capture_rb, capture_callback(captures.clone()))
+            .add(
+                &skel.maps.dns_capture_rb,
+                capture_callback(captures.clone(), payload.clone()),
+            )
             .context("ringbuf add capture")?;
         rb_builder
             .add(&skel.maps.events, move |data: &[u8]| -> i32 {
@@ -638,7 +670,9 @@ fn worker_loop(
     }
 
     let _ = xdp.detach(ifindex, XdpFlags::UPDATE_IF_NOEXIST);
-    write_payloads("payloads.json", &captures.lock().unwrap());
+    if payload.load(Ordering::Relaxed) {
+        write_payloads("payloads.json", &captures.lock().unwrap());
+    }
     result
 }
 
@@ -648,6 +682,7 @@ fn ui_loop<B: ratatui::backend::Backend>(
     feed_rx: &Receiver<FeedEvent>,
     shared: &Shared,
     stop: &AtomicBool,
+    payload: &AtomicBool,
 ) -> Result<()> {
     let mut app = App::new();
 
@@ -658,6 +693,7 @@ fn ui_loop<B: ratatui::backend::Backend>(
         }
         app.dropped = shared.dropped.load(Ordering::Relaxed);
         app.status = shared.status.lock().unwrap().clone();
+        app.payload_on = payload.load(Ordering::Relaxed);
 
         // Render the cache straight out of the shared snapshot — no per-frame
         // clone of a potentially large map.
@@ -670,7 +706,7 @@ fn ui_loop<B: ratatui::backend::Backend>(
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    app.handle_key(key, stop, &shared.refresh);
+                    app.handle_key(key, stop, &shared.refresh, payload);
                 }
             }
         }
@@ -739,7 +775,7 @@ fn draw(f: &mut Frame, app: &mut App, cache: &[ReverseEntry]) {
 }
 
 /// Keyboard shortcuts shown in the help overlay.
-const HELP_LINES: [&str; 15] = [
+const HELP_LINES: [&str; 16] = [
     "",
     "  ?, h        Toggle this help",
     "  /           Filter by name / address (Enter apply · Esc clear)",
@@ -748,7 +784,8 @@ const HELP_LINES: [&str; 15] = [
     "  s / S        Cycle sort column / toggle direction",
     "  l            Latest: events newest-first (Time ↓)",
     "  Tab          Switch panel (Events / Cache)",
-    "  Space, p     Pause / resume the live feed",
+    "  Space        Pause / resume the live feed",
+    "  p            Toggle writing payloads to payloads.json",
     "  r            Refresh the reverse cache now",
     "  ↑ ↓          Move selection (PgUp/PgDn by 10)",
     "  g / G        Jump to top / bottom",
@@ -1076,23 +1113,45 @@ mod tui_tests {
     fn filter_typing_consumes_keys() {
         let stop = AtomicBool::new(false);
         let refresh = AtomicBool::new(false);
+        let payload = AtomicBool::new(false);
         let mut app = App::new();
 
-        app.handle_key(key(KeyCode::Char('/')), &stop, &refresh);
+        app.handle_key(key(KeyCode::Char('/')), &stop, &refresh, &payload);
         assert!(app.filtering);
         // 'q' is typed into the filter, not treated as quit.
-        app.handle_key(key(KeyCode::Char('q')), &stop, &refresh);
-        app.handle_key(key(KeyCode::Char('z')), &stop, &refresh);
+        app.handle_key(key(KeyCode::Char('q')), &stop, &refresh, &payload);
+        app.handle_key(key(KeyCode::Char('z')), &stop, &refresh, &payload);
         assert_eq!(app.filter, "qz");
         assert!(!stop.load(Ordering::SeqCst), "typing must not quit");
 
         // Enter applies and exits the input; Esc would clear it.
-        app.handle_key(key(KeyCode::Enter), &stop, &refresh);
+        app.handle_key(key(KeyCode::Enter), &stop, &refresh, &payload);
         assert!(!app.filtering);
         assert_eq!(app.filter, "qz");
 
-        app.handle_key(key(KeyCode::Char('q')), &stop, &refresh);
+        app.handle_key(key(KeyCode::Char('q')), &stop, &refresh, &payload);
         assert!(stop.load(Ordering::SeqCst), "q quits in normal mode");
+    }
+
+    #[test]
+    fn p_toggles_payload_flag() {
+        let stop = AtomicBool::new(false);
+        let refresh = AtomicBool::new(false);
+        let payload = AtomicBool::new(false);
+        let mut app = App::new();
+
+        app.handle_key(key(KeyCode::Char('p')), &stop, &refresh, &payload);
+        assert!(payload.load(Ordering::Relaxed), "p turns payload writing on");
+        assert!(app.payload_on);
+
+        app.handle_key(key(KeyCode::Char('p')), &stop, &refresh, &payload);
+        assert!(!payload.load(Ordering::Relaxed), "p toggles it back off");
+        assert!(!app.payload_on);
+
+        // Space still pauses without touching the payload flag.
+        app.handle_key(key(KeyCode::Char(' ')), &stop, &refresh, &payload);
+        assert!(app.paused);
+        assert!(!payload.load(Ordering::Relaxed));
     }
 
     fn key(code: KeyCode) -> KeyEvent {

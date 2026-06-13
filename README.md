@@ -157,12 +157,13 @@ make test-one TEST=parses_multi_label_fqdn
 ## Usage
 
 ```bash
-sudo ./target/debug/ebpf-dns-cache [-v] [--dump-cache | --tui] <interface>
+sudo ./target/debug/ebpf-dns-cache [-v] [--payload] [--dump-cache | --tui] <interface>
 # e.g.
 sudo ./target/debug/ebpf-dns-cache eth0
 ```
 
 - `-v` enables verbose BPF debug logging.
+- `--payload` writes captured raw DNS payloads to `payloads.json` (for debugging or test generation). Off by default; in `--tui` mode it sets the initial state of the `p` toggle.
 - `--dump-cache` prints the current reverse cache and exits (see below). An interface is not required in this mode.
 - `--tui` runs an interactive terminal UI (see [Interactive TUI](#interactive-tui)). Requires an interface; mutually exclusive with `--dump-cache`.
 
@@ -175,7 +176,7 @@ INFO [loader] [txid=9174 answer=1] api.example.com A 93.184.216.35
 INFO [loader] [txid=2976 answer=0] connectivity-check.ubuntu.com AAAA 2620:2d:4000:1::17
 ```
 
-Structured logs go to `dns-cache_YYYY-MM-DD_HH-MM-SS.log`. Raw DNS payloads (for debugging or test generation) are written to `payloads.json`.
+Structured logs go to `dns-cache_YYYY-MM-DD_HH-MM-SS.log`. Raw DNS payloads (for debugging or test generation) are written to `payloads.json` only when `--payload` is passed.
 
 ### Dumping the reverse cache
 
@@ -205,7 +206,7 @@ sudo ./target/release/ebpf-dns-cache --tui eth0
 - **Events** — a live feed of parsed DNS answers (local arrival time `HH:MM:SS`, name, record type, address, TTL, transaction id / answer index) as they arrive on the `events` ring buffer. By default the feed is sorted newest-first (most recent at the top) and follows new arrivals; press `l` at any time to jump back to this latest-first view.
 - **Cache** — the in-kernel `dns_reverse` map (`Time` — local insertion time `HH:MM:SS`, derived from age at snapshot — `address → name`, TTL, age, and `Left` — the time-to-live remaining, computed as `TTL − age`), re-read every ~5 seconds (or on demand with `r`), with expired entries filtered out.
 
-A background worker thread owns the skeleton and ring buffers and snapshots the cache; the main thread renders and handles input. In TUI mode logging is file-only (`dns-cache_*.log`) so it can't corrupt the screen, and `payloads.json` is still written.
+A background worker thread owns the skeleton and ring buffers and snapshots the cache; the main thread renders and handles input. In TUI mode logging is file-only (`dns-cache_*.log`) so it can't corrupt the screen. Payload capture to `payloads.json` is toggled live with `p` (initialised from the `--payload` flag).
 
 Both panels support **filtering** and **sorting**. The filter is a case-insensitive substring matched against both the name and the address; sorting cycles through the panel's columns (the sorted column is marked with `↑`/`↓` in its header). The Events feed starts sorted by `Time` descending (newest at the top) and follows new arrivals there; choosing any other sort column or direction suspends following until you press `l` to return to the default latest-first view.
 
@@ -222,12 +223,13 @@ Keybindings:
 | `l` | reset the Events feed to the default latest-first view (`Time ↓`) and resume following |
 | `↑` / `↓`, `PgUp` / `PgDn` | scroll the active panel (PgUp/PgDn by 10 rows) |
 | `g` / `G` | jump to top / bottom (top is the newest event; `g` resumes following) |
-| `Space` / `p` | pause/resume the feed (also auto-paused when you scroll) |
+| `Space` | pause/resume the feed (also auto-paused when you scroll) |
+| `p` | toggle writing captured payloads to `payloads.json` |
 | `r` | force an immediate cache refresh |
 | `?` / `h` | toggle the help overlay |
 | `q` / `Esc` / `Ctrl-C` | quit (detaches XDP and restores the terminal) |
 
-The footer shows live/paused state, the active sort, the active filter, current cache size, the count of feed events dropped under load, and any worker error.
+The footer shows live/paused state, the active sort, whether payload capture is on/off, the active filter, current cache size, the count of feed events dropped under load, and any worker error.
 
 ## Kernel requirements
 
