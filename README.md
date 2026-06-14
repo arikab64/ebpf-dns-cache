@@ -2,12 +2,6 @@
 
 An in-kernel DNS response parser built with eBPF XDP and Rust. It captures DNS A/AAAA records from live network traffic at the network driver level, before packets reach the kernel networking stack.
 
-## Concept
-
-Every DNS response carries a mapping from a domain name to one or more IP addresses. Normally, user-space resolvers (glibc, systemd-resolved) handle this — but they are invisible to programs that want to observe or cache these mappings at the OS level.
-
-This project attaches an XDP program to a network interface and parses every incoming DNS response in the kernel, emitting structured events (domain → IP) to user space via a ring buffer. The goal is zero-copy, low-overhead DNS observation that works independently of the resolver in use.
-
 ## Architecture
 
 ```mermaid
@@ -62,41 +56,11 @@ flowchart LR
 
 All mutable parser state lives in a `BPF_MAP_TYPE_PERCPU_ARRAY` with one slot. Because XDP processes each packet on the CPU that receives it, no locking is needed — each CPU has its own copy of the state structure.
 
-```c
-struct dns_parser_state {
-    u16  id;              // DNS transaction ID
-    u32  dns_base;        // byte offset of DNS header in packet
-    u32  packet_offset;   // current read position
-    u16  q_remaining;     // questions left to skip
-    u16  a_remaining;     // answers left to parse
-    u16  answer_idx;      // index of current answer record
-    u8   return_prog;     // which program parse_fqdn should tail-call back to
-    char name_buf[512];   // assembled domain name
-    cache_entry_t cache[256];     // suffix cache (offset → name window)
-    pending_label_t pending[256]; // labels recorded during current name walk
-    frame_t stack[16];            // call stack for pointer chains
-};
-```
 
 ### Reverse cache (address → name)
 
 Emitting events to user space is enough for observation, but enforcement needs to answer the inverse question at packet time: *given a destination IP, what name was it resolved from?* To support that, the final tail-call stage (`xdp_dns_emit_events`) also writes each A/AAAA record into an in-kernel **reverse cache** — an `BPF_MAP_TYPE_LRU_HASH` keyed by address, holding the owner name:
 
-```c
-typedef struct dns_ip_key {          // key — fully zeroed before use (LRU hashes every byte)
-    u8  is_ipv6;                     // 0 = A (v4), 1 = AAAA (v6)
-    u8  _pad[3];
-    u8  addr[16];                    // network order; v4 in addr[0..4], v6 in addr[0..16]
-} dns_ip_key_t;
-
-typedef struct dns_rev_value {
-    u64  inserted_ns;                // bpf_ktime_get_ns() at last write
-    u32  ttl;                        // record TTL (seconds)
-    u16  name_len;
-    u16  _pad;
-    char name[256];                  // owner FQDN, zero-padded
-} dns_rev_value_t;
-```
 
 Design notes:
 
@@ -200,7 +164,7 @@ Entries whose age exceeds their TTL are skipped (treated as a miss), so the dump
 `--tui` attaches like a normal run but, instead of streaming log lines, presents a [ratatui](https://ratatui.rs)-based terminal UI with two tabbed panels:
 
 ```bash
-sudo ./target/release/loader --tui eth0
+sudo ./target/release/ebpf-dns-cache --tui eth0
 ```
 
 - **Events** — a live feed of parsed DNS answers (local arrival time `HH:MM:SS`, name, record type, address, TTL, transaction id / answer index) as they arrive on the `events` ring buffer. By default the feed is sorted newest-first (most recent at the top) and follows new arrivals; press `l` at any time to jump back to this latest-first view.
@@ -248,21 +212,4 @@ The footer shows live/paused state, the active sort, whether payload capture is 
 | BTF (for `vmlinux.h`) | 5.2 |
 
 Linux 5.8 or later is recommended.
-
-### Verifier workarounds
-
-The eBPF verifier tracks the range of every scalar value and rejects programs that perform arithmetic it cannot prove is bounded. The DNS parser is inherently variable-length, which creates friction. Two patterns appear throughout the C code:
-
-```c
-// Hide a value's provenance so the verifier treats it as an unknown scalar,
-// forcing subsequent masks to be the sole proof of boundedness.
-#define BARRIER(var) asm volatile("" : "+r"(var))
-
-// After BARRIER, mask to prove the value fits in a buffer index.
-cursor = (cursor + label_len) & (DNS_NAME_BUF - 1);
-```
-
-Loop bodies are unrolled with `#pragma clang loop unroll(full)` where the iteration count is known at compile time.
-
-
 
