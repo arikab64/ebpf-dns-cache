@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev zlib1g-dev pkg-config make bpftool
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Generate vmlinux.h
+        run: make vmlinux
+
+      - name: Build release binary
+        run: make release
+
+      - name: Package release artifact
+        run: |
+          mkdir -p dist
+          cp target/release/ebpf-dns-cache dist/
+          tar -C dist -czf ebpf-dns-cache-${GITHUB_REF_NAME}-linux-x86_64.tar.gz ebpf-dns-cache
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ebpf-dns-cache-${{ github.ref_name }}-linux-x86_64.tar.gz
